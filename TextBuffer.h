@@ -5,228 +5,229 @@
 #include <string>
 #include <vector>
 
-/// 文本块：指向某个缓冲区中的一段连续字节区间。
-/// 位置用「起始字节下标 + 字节长度」表示，比原版省掉了行号、列号、结束行列四组字段。
+/// a piece: one contiguous run of bytes inside one of the buffers
+/// we describe it by "start byte + byte length" only. the original piece also
+/// carried the line and column of both ends, we dropped all four of those fields
 struct Piece
 {
-    uint32_t buffer = 0;  ///< 所属缓冲区编号
-    uint32_t begin = 0;   ///< 在缓冲区中的起始字节下标
-    uint32_t length = 0;  ///< 字节长度
-    uint32_t lines = 0;   ///< 该区间内的换行符个数
+    uint32_t buffer = 0;  /// which buffer we point into
+    uint32_t begin  = 0;   /// first byte of our run inside that buffer
+    uint32_t length = 0;  /// how many bytes the run has
+    uint32_t lines  = 0;   /// how many '\n' sit inside those bytes
 };
 
-/// 只读缓冲区：一块文本加上它的行首字节下标表。
+/// a read only buffer: the text plus the byte offset of every line start
+/// we never edit a buffer in place, we only ever add new ones (the original text
+/// and the text the user typed), so an old piece can keep pointing into one
 struct Buffer
 {
-    std::string text;                 ///< 全部文本
-    std::vector<uint32_t> lineStart;  ///< 每一行的起始字节下标
+    std::string text;                 /// the whole text of this buffer
+    std::vector<uint32_t> lineStart;  /// byte offset where each line begins
 };
 
-/// 文档中的一个位置，行号与列号均从 0 开始，列号按字节计。
+/// a place in the document, line and column both start at 0
+/// watch out: the column is counted in BYTES here, not in characters
 struct Position
 {
     uint32_t line = 0;
     uint32_t column = 0;
 };
 
-/// 红黑树结点：文本块按文档顺序组成一棵二叉搜索树。
-/// 哨兵结点的 piece.length 恒为 0，用它判断空子树（空子树同时也是叶子）。
+/// a red black tree node. pieces hang in this tree in document order, so a plain
+/// in-order walk hands the document back
+/// the sentinel's piece.length is always 0, and isReal() uses exactly that to
+/// tell a real node from an empty subtree -- the sentinel doubles as every leaf,
+/// so an "empty child" is never a null pointer you can follow by accident
 struct PieceNode
 {
-    Piece piece;                  ///< 本结点持有的文本块
-    bool red = false;             ///< 是否为红结点
-    PieceNode *parent = nullptr;  ///< 父结点，根结点的父结点是哨兵
-    PieceNode *left = nullptr;    ///< 左孩子
-    PieceNode *right = nullptr;   ///< 右孩子
-    uint32_t size = 0;            ///< 左子树的总字节数
-    uint32_t lines = 0;           ///< 左子树的总换行数
-    uint32_t totalSize = 0;       ///< 整棵子树的总字节数
-    uint32_t totalLines = 0;      ///< 整棵子树的总换行数
+    Piece piece;                  /// the piece this node holds
+    bool red = false;             /// red or black, that is the whole colour
+    PieceNode *parent = nullptr;  /// father, the root's father is the sentinel
+    PieceNode *left = nullptr;    /// left child, sentinel when empty
+    PieceNode *right = nullptr;   /// right child, sentinel when empty
+    uint32_t size = 0;            /// total bytes of the LEFT subtree only
+    uint32_t lines = 0;           /// total newlines of the LEFT subtree only
+    uint32_t totalSize = 0;       /// total bytes of the whole subtree
+    uint32_t totalLines = 0;      /// total newlines of the whole subtree
 };
 
-/// 精简版文本缓冲区：红黑树索引的块表（Piece Table）。
+/// a cut down piece table backed by a red black tree
 ///
-/// 与原版的关系与取舍：
-///   - 保留原版的两条核心思路：
-///       1）文本只追加、编辑只改块表，所以插入删除与文档总长无关；
-///       2）块表用红黑树索引，靠左右旋维持平衡，子树统计量支持按下标二分下降；
-///   - 去掉原版的行号列号双坐标体系，块只记字节下标与长度；
-///   - 去掉原版的撤销栈、编码识别、换行风格记录，只保留能跑起来的最小功能；
-///   - 红黑树用「单哨兵」的经典写法，五条不变量由 checkTree() 逐条校验。
+/// how it relates to the original, and what we gave up on purpose:
+///   - the two ideas that really matter are kept:
+///       1) text is append only and editing only rewrites the piece table, so an
+///          insert or an erase costs O(log pieces) no matter how long the
+///          document is -- that is the whole point of a piece table
+///       2) the piece table is indexed by a red black tree, rotations keep it
+///          balanced and the subtree counters let us walk down by byte offset
+///   - the original's twin line/column coordinate system is gone, a piece now
+///     remembers a byte offset and a byte length and nothing else
+///   - the undo stack, the encoding detection and the line ending bookkeeping are
+///     gone too, only the minimum that still runs is left
+///   - the tree uses the classic "one single sentinel" trick, and checkTree()
+///     verifies the five red black invariants one by one
 ///
-/// 算法复杂度：任意操作 O(log 块数)，块数超过上限时整体整理一次。
+/// every operation is O(log pieces), and once we hold too many pieces we rework
+/// the whole document in one go (compact())
 class TextBuffer
 {
 public:
-    /// 构造一个空缓冲区。
+    /// build an empty buffer
     TextBuffer();
 
-    /// 释放缓冲区与全部结点。
+    /// release every node and every buffer we own
     ~TextBuffer();
 
-    /// 禁止拷贝，缓冲区独占底层存储。
-    TextBuffer(const TextBuffer &) = delete;
-
-    /// 禁止赋值，缓冲区独占底层存储。
-    TextBuffer &operator=(const TextBuffer &) = delete;
-
-    /// 清空全部内容。
+    /// throw everything away and go back to an empty document
     void clear();
 
-    /// 读出全部文本。
+    /// returns the whole document
     std::string text() const;
 
-    /// 读出 [from, to) 区间内的文本。
+    /// returns the bytes in [from, to)
     std::string range(uint32_t from, uint32_t to) const;
 
-    /// 在 offset 处插入文本，返回实际插入的字节数。
-    /// 传入的 CRLF 与单独的 CR 都会被归一成 LF，保证换行符不会被块边界劈开。
+    /// insert text at offset, returns how many bytes really went in
+    /// CRLF and a lone CR are both normalised to LF first, so a newline never
+    /// ends up split across a piece boundary
     uint32_t insert(uint32_t offset, const std::string &text);
 
-    /// 删除 [from, to) 区间，返回实际删除的字节数。
     uint32_t erase(uint32_t from, uint32_t to);
-
-    /// 用 text 替换 [from, to) 区间，返回被替换掉的字节数。
     uint32_t replace(uint32_t from, uint32_t to, const std::string &text);
 
-    /// 行号、列号换算成字节下标。
+    /// (line, column) -> byte offset
+    /// byte offset -> (line, column)
     uint32_t offsetOf(uint32_t line, uint32_t column) const;
-
-    /// 字节下标换算成行号与列号。
     Position positionOf(uint32_t offset) const;
 
-    /// 第 line 行的起始字节下标。
+    /// byte offset where line `line` starts
     uint32_t lineBegin(uint32_t line) const;
 
-    /// 第 line 行的结束字节下标（不含行尾换行符）。
+    /// byte offset where line `line` ends, the trailing newline is NOT included
     uint32_t lineEnd(uint32_t line) const;
 
-    /// 第 line 行的内容（不含行尾换行符）。
+    /// the text of line `line`, again without its trailing newline
     std::string lineText(uint32_t line) const;
 
-    /// 查找 needle 第一次出现的位置，找不到返回 -1。
+    /// first occurrence of needle at or after `from`, -1 when there is none
     long find(const std::string &needle, uint32_t from) const;
 
-    /// 总行数，空文档也算 1 行。
+    /// how many lines we have, an empty document still counts as one
     uint32_t lineCount() const;
-
-    /// 总字节数。
-    uint32_t byteCount() const { return _bytes; }
-
-    /// 最长一行的字节数。
+    uint32_t byteCount() const   { return _bytes;   }
     uint32_t longestLine() const { return _longest; }
-
-    /// 块数量，供观察整理效果。
-    uint32_t pieceCount() const { return _count; }
-
-    /// 树的高度，供观察平衡效果。
+    uint32_t pieceCount() const  { return _count;   }
     uint32_t treeHeight() const;
 
-    /// 自检：块区间、子树统计与红黑树五条不变量是否全部成立。
+    /// check yourself: piece ranges, subtree counters and the five red black
+    /// invariants, all of them
     bool check() const;
 
-    /// 自检并把失败原因写入 where，便于定位。
+    /// the same check, but tell me which one broke through `where`
     bool check(const char *&where) const;
 
-    /// 按中序打印块表，用于排查统计量问题。
+    /// print the piece table in order, for chasing down a counter that went wrong
     void dump() const;
 
 private:
-    /// 建一个红结点（孩子先指向哨兵，颜色由插入修正决定）。
+    /// make a red node (children start at the sentinel, the insert fixup decides
+    /// the colour afterwards)
     PieceNode *newNode(const Piece &piece);
 
-    /// 重算结点的子树统计量。
+    /// recompute one node's subtree counters
     void refresh(PieceNode *node);
 
-    /// 重算结点自身及其全部祖先的子树统计量。
+    /// recompute a node and every ancestor up to the root
     void refreshUp(PieceNode *node);
-
-    /// 以 node 为轴左旋。
     void rotateLeft(PieceNode *node);
-
-    /// 以 node 为轴右旋。
     void rotateRight(PieceNode *node);
 
-    /// 把 v 子树接到 u 的位置上。
+    /// put v where u used to sit
     void transplant(PieceNode *u, PieceNode *v);
 
-    /// 子树里的最左结点。
+    /// the leftmost node of a subtree
     PieceNode *leftmostNode(PieceNode *node) const;
 
-    /// 块顺序上的下一个结点（中序后继），没有则返回哨兵。
+    /// the next node in piece order (in-order successor), sentinel when there is none
     PieceNode *nextNode(PieceNode *node) const;
 
-    /// 把 node 挂到 parent 的指定一侧，并沿父链重算统计、做插入修正。
+    /// hang node on one side of parent, recount up the father chain and run the
+    /// insert fixup
     void attach(PieceNode *node, PieceNode *parent, bool asLeft);
 
-    /// 按块顺序插到树尾（最后一块之后）。
+    /// insert at the very end of the piece order
     void insertNode(PieceNode *node);
 
-    /// 按块顺序插到 where 之前。
+    /// insert right before `where` in piece order
     void insertBefore(PieceNode *where, PieceNode *node);
 
-    /// 按块顺序插到 where 之后。
+    /// insert right after `where` in piece order
     void insertAfter(PieceNode *where, PieceNode *node);
 
-    /// 插入修正：消除连续红结点。
+    /// insert fixup: get rid of two reds in a row
     void insertFixup(PieceNode *node);
 
-    /// 删除修正：消除双重黑结点。
+    /// delete fixup: get rid of a double black
     void deleteFixup(PieceNode *node);
 
-    /// 删除结点（红黑树删除 + 修正），结点转入回收表。
+    /// drop a node for real (red black delete plus fixup), the node gets parked in
+    /// the released list instead of being freed right away
     void removeNode(PieceNode *node);
 
-    /// 按字节下标定位结点，inside 返回块内偏移。
+    /// find the node holding this byte offset, inside returns the offset in the piece
     PieceNode *nodeAt(uint32_t offset, uint32_t *inside) const;
 
-    /// 取第 line 行的行首字节下标（内部实现，行号必须有效）。
+    /// byte offset of a line start (internal, the line number must already be valid)
     uint32_t lineBeginAt(uint32_t line) const;
 
-    /// 数出 node 前面的总字节数。
+    /// count the bytes in front of node
     uint32_t bytesBefore(PieceNode *node) const;
 
-    /// 把 node 从块内偏移 inside 处切开，返回后半段（前半段留在原结点）。
+    /// cut node at offset `inside` and give back the back half, the front half
+    /// stays in node
     PieceNode *splitNode(PieceNode *node, uint32_t inside);
 
-    /// 从 offset 起删除 length 个字节（内部自行处理块边界）。
+    /// delete length bytes starting at offset, piece boundaries are handled inside
     void removeBytes(uint32_t offset, uint32_t length);
 
-    /// 合并相邻且首尾相接的块。
+    /// glue neighbouring pieces that are contiguous
     void merge();
 
-    /// 中序遍历中找到第一对可合并的相邻块并合并，成功返回 true。
+    /// find the first pair of neighbouring pieces that can merge, glue them and
+    /// return true; false when there is nothing left to glue
     bool mergeOnePair();
 
-    /// 整体整理：把全部内容写进一个新缓冲区，树收缩为单个结点。
+    /// rework everything: dump the document into one fresh buffer and shrink the
+    /// tree down to a single node
     void compact();
 
-    /// 重算总字节数、总行数、块数与最长行。
+    /// rebuild total bytes, total lines, piece count and the longest line
     void recount();
 
-    /// 校验红黑树不变量，失败时把原因写入 where。
+    /// check the red black invariants, the broken one is written into `where`
     bool checkTree(const char *&where) const;
 
-    /// 递归校验子树：返回黑高，同时检查红结点孩子、统计量与块区间。
+    /// recursively check a subtree: returns its black height and checks the red
+    /// children, the counters and the piece range on the way
     uint32_t checkSubtree(PieceNode *node, const char *&where) const;
 
-    /// 统计一段文本里的换行符个数。
+    /// count the newlines inside a chunk of text
     static uint32_t countLines(const char *data, size_t length);
 
-    /// 把一段文本登记为新缓冲区并返回它的编号。
+    /// register a chunk of text as a new buffer and hand back its id
     uint32_t addBuffer(const std::string &text);
 
-    /// 丢弃全部结点，把树复位成空。
+    /// drop every node and reset the tree to empty
     void freeTree();
 
-    std::vector<Buffer *> _buffers;      ///< 全部只读缓冲区
-    PieceNode *_nil = nullptr;           ///< 哨兵结点，全树共用一个
-    PieceNode *_root = nullptr;          ///< 根结点
-    std::vector<PieceNode *> _released;  ///< 删除后回收的结点，析构时统一释放
-    uint32_t _bytes = 0;                 ///< 总字节数
-    uint32_t _lines = 1;                 ///< 总行数
-    uint32_t _longest = 0;               ///< 最长行的字节数
-    uint32_t _count = 0;                 ///< 块数量
+    std::vector<Buffer *> _buffers;      /// every read only buffer we ever made
+    PieceNode *_nil    = nullptr;           /// the sentinel, one single one for the tree
+    PieceNode *_root   = nullptr;          /// the root
+    std::vector<PieceNode *> _released;  /// deleted nodes, all freed by freeTree()
+    uint32_t _bytes     =  0;                 /// total bytes
+    uint32_t _lines     =  1;                 /// total lines
+    uint32_t _longest   =  0;               /// bytes of the longest line
+    uint32_t _count     =  0;                 /// how many pieces we hold
 };
 
 #endif // TEXTBUFFER_H

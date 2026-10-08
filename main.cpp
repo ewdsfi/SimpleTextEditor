@@ -10,28 +10,32 @@
 #include <windows.h>
 #endif
 
-/// 进入程序前控制台的代码页，退出时还原，避免影响别的程序。
+/// The console code pages we found on the way in, restored on the way out so we
+/// don't leave the user's terminal in a weird state for the next program.
 static unsigned int g_savedOutputCodePage = 0;
 static unsigned int g_savedInputCodePage = 0;
 
-/// 把控制台切到 UTF-8，否则中文会按 GBK 解释成乱码。
+/// Switches the console over to UTF-8, otherwise Chinese comes out as mojibake
+/// because the console happily interprets our UTF-8 bytes as GBK.
 static void useUtf8Console()
 {
 #ifdef _WIN32
-    // 先记下原来的代码页，退出时还原
+    // remember what we are about to clobber, restoreConsole() needs it later
     g_savedOutputCodePage = GetConsoleOutputCP();
     g_savedInputCodePage = GetConsoleCP();
 
-    // 输入输出代码页都切成 UTF-8，让控制台按 UTF-8 解释程序写出的字节
+    // both directions, not just output: we also type UTF-8 paths and search text
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
 }
 
-/// 还原控制台代码页。
+/// Restores the console code pages.
 static void restoreConsole()
 {
 #ifdef _WIN32
+    // the zero check guards against the case where useUtf8Console() never got to
+    // save anything -- restoring a NULL code page would be worse than doing nothing
     if (g_savedOutputCodePage != 0) {
         SetConsoleOutputCP(g_savedOutputCodePage);
     }
@@ -42,7 +46,11 @@ static void restoreConsole()
 #endif
 }
 
-/// 把一行命令按空白切开，引号内的空白不算分隔。
+/// Splits a command line on whitespace, but whitespace inside quotes does not
+/// count as a separator.
+/// the quote characters themselves are thrown away, so "a b" arrives as one
+/// word and you can't get a literal quote into a filename this way. there is no
+/// escaping in here -- backslashes are handled later, by unescape().
 static std::vector<std::string> splitWords(const std::string &line)
 {
     std::vector<std::string> words;
@@ -52,12 +60,14 @@ static std::vector<std::string> splitWords(const std::string &line)
     for (size_t i = 0; i < line.size(); i++) {
         const char c = line[i];
 
+        // a quote just flips the state, it never ends up in a word
         if (c == '"') {
             quoted = !quoted;
 
             continue;
         }
 
+        // only unquoted spaces and tabs break a word, quoted ones are content
         if (!quoted && (c == ' ' || c == '\t')) {
             if (!current.empty()) {
                 words.push_back(current);
@@ -70,6 +80,7 @@ static std::vector<std::string> splitWords(const std::string &line)
         current.push_back(c);
     }
 
+    // the last word has no trailing separator to flush it, so flush it here
     if (!current.empty()) {
         words.push_back(current);
     }
@@ -77,12 +88,18 @@ static std::vector<std::string> splitWords(const std::string &line)
     return words;
 }
 
-/// 把转义写法还原成真实字符，支持 \n \t \\ \" 与 \r。
+/// Turns escape sequences back into real characters, supporting \n \t \\ \"
+/// and \r.
+/// an unknown escape keeps the character after the backslash as-is (the
+/// backslash is dropped), which is friendlier than refusing the whole command.
+/// watch out: a trailing lone backslash survives as a backslash, there is no
+/// "incomplete escape" error.
 static std::string unescape(const std::string &text)
 {
     std::string out;
 
     for (size_t i = 0; i < text.size(); i++) {
+        // not an escape, or a backslash with nothing behind it -- copy as-is
         if (text[i] != '\\' || i + 1 >= text.size()) {
             out.push_back(text[i]);
 
@@ -109,11 +126,16 @@ static std::string unescape(const std::string &text)
     return out;
 }
 
-/// 解析 line:column 形式的坐标，同时兼容纯行号。
+/// Parses a "line:column" coordinate, and also accepts a bare line number.
+/// both forms always succeed: a bare "3" is line 3 column 0, and anything
+/// strtoul can't read simply becomes 0. so a typo like "abc" quietly means
+/// 0:0 instead of complaining -- the buffer's own range checks are what keep
+/// us honest.
 static bool parsePoint(const std::string &text, uint32_t &line, uint32_t &column)
 {
     const size_t colon = text.find(':');
 
+    // no colon means the whole word is a line number, column defaults to 0
     if (colon == std::string::npos) {
         line = static_cast<uint32_t>(std::strtoul(text.c_str(), nullptr, 10));
         column = 0;
@@ -127,7 +149,11 @@ static bool parsePoint(const std::string &text, uint32_t &line, uint32_t &column
     return true;
 }
 
-/// 打印一段文本，并把行尾标出来，便于确认换行位置。
+/// Prints a piece of text with its line ends marked, so you can tell where the
+/// newlines actually are.
+/// we escape '\n' and '\t' instead of printing them raw: a raw newline would
+/// quietly turn one line of output into two and make the line count in your head
+/// wrong, and a raw tab would wreck the terminal alignment.
 static void printQuoted(const std::string &text)
 {
     std::printf("\"");
@@ -151,12 +177,12 @@ static void printQuoted(const std::string &text)
     std::printf("\"\n");
 }
 
-/// 打印用法。
+/// Prints the usage text.
 static void printHelp()
 {
     std::printf("可用命令：\n");
     std::printf("  open <路径>              打开文件\n");
-    std::printf("  save [路径]              保存（带路径即另存为）\n");
+    std::printf("  save                     保存回当前文件\n");
     std::printf("  new                      清空并断开文件\n");
     std::printf("  info                     显示路径、行数、字节数、块数、树高\n");
     std::printf("  show [起行] [止行]       按行显示内容（行号从 0 开始）\n");
@@ -172,11 +198,13 @@ static void printHelp()
     std::printf("  quit                     退出\n");
 }
 
-/// 处理一条命令，返回 false 表示要退出。
+/// Handles one command, returning false when it is time to quit.
 static bool runCommand(Document &document, const std::string &line)
 {
     const std::vector<std::string> words = splitWords(line);
 
+    // a blank line (or one that was only spaces) is not an error, just nothing
+    // to do -- this matters a lot for script files with trailing newlines
     if (words.empty()) {
         return true;
     }
@@ -184,6 +212,7 @@ static bool runCommand(Document &document, const std::string &line)
     const std::string &command = words[0];
     TextBuffer *buffer = document.buffer();
 
+    // "exit" is an alias people type by reflex, we may as well accept it
     if (command == "quit" || command == "exit") {
         return false;
     }
@@ -194,6 +223,8 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- open ----
+    // loads the file and replaces everything in the buffer, unsaved edits and all
     if (command == "open") {
         if (words.size() < 2) {
             std::printf("用法：open <路径>\n");
@@ -212,10 +243,11 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- save ----
+    // writes back to the current path only, there is no Save As
     if (command == "save") {
-        const bool ok = (words.size() >= 2) ? document.saveAs(words[1]) : document.save();
-
-        if (!ok) {
+        // the usual reason this fails is that the document is still unnamed
+        if (!document.save()) {
             std::printf("%s\n", document.error().c_str());
 
             return true;
@@ -226,6 +258,9 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- new ----
+    // wipes the buffer AND forgets the path, so a stray save can't clobber the
+    // file you were just working on
     if (command == "new") {
         document.createNew();
         std::printf("已清空\n");
@@ -233,6 +268,9 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- info ----
+    // a quick health report for the piece tree: line/byte counts, piece count
+    // and tree height are what you watch when you are hunting for a bad split
     if (command == "info") {
         std::printf("文件：%s\n", document.named() ? document.path().c_str() : "（未命名）");
         std::printf("行数：%u\n", buffer->lineCount());
@@ -244,15 +282,23 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- show ----
+    // dumps a range of lines with their starting byte offset; the whole point is
+    // to eyeball offsets, so don't be surprised that it prints line numbers too
     if (command == "show") {
         const uint32_t total = buffer->lineCount();
         const uint32_t from = (words.size() >= 2) ? static_cast<uint32_t>(std::strtoul(words[1].c_str(), nullptr, 10)) : 0;
         uint32_t to = (words.size() >= 3) ? static_cast<uint32_t>(std::strtoul(words[2].c_str(), nullptr, 10)) : from + 39;
 
+        // no end line given means "40 lines from the start", clamp it so we
+        // don't run off the end of the document
         if (to >= total) {
             to = total - 1;
         }
 
+        // the number < total guard matters: 'to' is uint32_t, so when the
+        // document has 0 lines the clamp above underflows to UINT_MAX and only
+        // this guard keeps us from printing forever
         for (uint32_t number = from; number <= to && number < total; number++) {
             const uint32_t begin = buffer->lineBegin(number);
 
@@ -262,6 +308,8 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- line ----
+    // prints a single line through printQuoted() so invisible line ends show up
     if (command == "line") {
         if (words.size() < 2) {
             std::printf("用法：line <行号>\n");
@@ -271,6 +319,8 @@ static bool runCommand(Document &document, const std::string &line)
 
         const uint32_t number = static_cast<uint32_t>(std::strtoul(words[1].c_str(), nullptr, 10));
 
+        // we range check here ourselves, the buffer is only too happy to read
+        // whatever offset you ask it for
         if (number >= buffer->lineCount()) {
             std::printf("行号超出范围，共 %u 行\n", buffer->lineCount());
 
@@ -282,6 +332,8 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- pos ----
+    // line:column -> byte offset, the direction the buffer calls offsetOf()
     if (command == "pos") {
         if (words.size() < 2) {
             std::printf("用法：pos <行>:<列>\n");
@@ -298,6 +350,9 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- at ----
+    // byte offset -> line:column, the inverse of pos, and it is what you reach
+    // for after find hands you a raw offset
     if (command == "at") {
         if (words.size() < 2) {
             std::printf("用法：at <字节下标>\n");
@@ -313,6 +368,9 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- find ----
+    // searches for the unescaped text, so "\n" in the command line really does
+    // search for a newline instead of the two characters backslash-n
     if (command == "find") {
         if (words.size() < 2) {
             std::printf("用法：find <文本> [起点]\n");
@@ -324,12 +382,16 @@ static bool runCommand(Document &document, const std::string &line)
         const uint32_t from = (words.size() >= 3) ? static_cast<uint32_t>(std::strtoul(words[2].c_str(), nullptr, 10)) : 0;
         const long hit = buffer->find(needle, from);
 
+        // find() reports "not found" as a negative offset, that is the whole
+        // contract -- there is no separate bool
         if (hit < 0) {
             std::printf("未找到\n");
 
             return true;
         }
 
+        // show both the raw offset and the human position, so you can copy
+        // either one straight into at / pos
         const Position position = buffer->positionOf(static_cast<uint32_t>(hit));
 
         std::printf("字节下标 %ld，位置 %u:%u\n", hit, position.line, position.column);
@@ -337,6 +399,9 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- insert ----
+    // the text comes as one single word, so quote it if it contains spaces;
+    // use \n inside it to actually create new lines
     if (command == "insert") {
         if (words.size() < 3) {
             std::printf("用法：insert <行>:<列> <文本>\n");
@@ -359,6 +424,9 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- erase ----
+    // both ends are line:column, not raw offsets (use pos first if you only have
+    // offsets in hand)
     if (command == "erase") {
         if (words.size() < 3) {
             std::printf("用法：erase <起点> <终点>，坐标写法为 行:列\n");
@@ -382,6 +450,9 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- replace ----
+    // erase + insert in one shot, so the interval never exists in a half-erased
+    // state and the statistics stay consistent
     if (command == "replace") {
         if (words.size() < 4) {
             std::printf("用法：replace <起点> <终点> <文本>\n");
@@ -406,7 +477,12 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- check ----
+    // walks the whole tree and re-derives every count, so it is slow but it is
+    // the thing you run after touching the rotations
     if (command == "check") {
+        // 'where' is written by check() and points at a string literal, we only
+        // read it when the check actually failed
         const char *where = nullptr;
 
         if (buffer->check(where)) {
@@ -420,19 +496,23 @@ static bool runCommand(Document &document, const std::string &line)
         return true;
     }
 
+    // ---- unknown ----
+    // everything else is a typo, don't guess at it -- just point at help
     std::printf("未知命令：%s，输入 help 查看用法\n", command.c_str());
 
     return true;
 }
 
-/// 读一行命令，并去掉可能存在于开头的 BOM。
+/// Reads one line of command, dropping a BOM that may be sitting at the head.
 static bool readCommand(std::string &line)
 {
     if (!std::getline(std::cin, line)) {
         return false;
     }
 
-    // 脚本文件常带 UTF-8 BOM，不去掉会污染第一条命令
+    // script files are often saved with a UTF-8 BOM, and we read stdin as a plain
+    // byte stream -- left alone those three bytes would glue themselves to the
+    // first command and make "open" look like "\xEF\xBB\xBFopen"
     if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF
         && static_cast<unsigned char>(line[1]) == 0xBB && static_cast<unsigned char>(line[2]) == 0xBF) {
         line.erase(0, 3);
@@ -441,29 +521,37 @@ static bool readCommand(std::string &line)
     return true;
 }
 
-/// 程序入口：可以带一个文件名，也可以带 --script 从标准输入读命令。
+/// Entry point: optionally takes a file name, or --script to read commands from
+/// stdin.
 int main(int argc, char *argv[])
 {
     useUtf8Console();
 
     Document document;
 
+    // a plain file name on the command line is opened right away; a failed open
+    // is only reported, we still drop into the prompt
     if (argc >= 2 && std::string(argv[1]) != "--script") {
         if (!document.load(argv[1])) {
             std::printf("%s\n", document.error().c_str());
         }
     }
 
-    // 脚本模式：从标准输入逐行读命令，不回显提示符
+    // Script mode: read commands from stdin line by line, no prompt echo.
+    // "--script" can be either the first or the second argument, the second slot
+    // exists so that "editor <file> --script" also works
     const bool script = (argc >= 2 && std::string(argv[1]) == "--script") || (argc >= 3 && std::string(argv[2]) == "--script");
 
     if (script) {
+        // in the "editor <file> --script" form --script sits in argv[2], so the
+        // load above never ran; do it here before we start eating commands
         if (argc >= 3 && std::string(argv[1]) != "--script") {
             document.load(argv[1]);
         }
 
         std::string line;
 
+        // no prompt, no fflush -- just run every command until EOF or quit
         while (readCommand(line)) {
             if (!runCommand(document, line)) {
                 break;
@@ -484,6 +572,9 @@ int main(int argc, char *argv[])
 
     std::string line;
 
+    // Interactive loop: print the prompt, flush it (stdout is buffered when it
+    // is a pipe), then wait for a line. EOF on stdin ends us just as cleanly as
+    // "quit" does
     while (true) {
         std::printf("> ");
         std::fflush(stdout);
