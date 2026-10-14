@@ -32,7 +32,7 @@ static bool isReal(const PieceNode *node)
 }
 
 TextBuffer::TextBuffer()
-
+{
     // the sentinel: black (invariant 3) and pointing at itself everywhere, so we
     // never have to check for null while walking the tree
     _nil = new PieceNode();

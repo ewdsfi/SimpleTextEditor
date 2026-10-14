@@ -35,6 +35,12 @@ public:
     /// quietly overwriting the file you were just editing.
     void createNew();
 
+    /// Points the document at another file WITHOUT touching the content.
+    /// this is what Save As needs: save() only ever writes to the current path,
+    /// so changing that path is the only way to write somewhere else. the path is
+    /// not checked here -- a bad one is reported by the next save().
+    void setPath(const std::string &path) { _path = path; }
+
     /// The text buffer, we hand out a raw pointer; it lives inside the document
     /// and never moves, so it stays valid for as long as the Document does.
     TextBuffer *buffer() { return &_buffer; }
