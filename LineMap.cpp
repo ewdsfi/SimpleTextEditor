@@ -5,12 +5,12 @@
 #include <algorithm>
 #include <cassert>
 
-/// ASCII 的推进量一次全部测好；之后每碰到一个西文字符都不用再问字体
+/// ASCII advances are measured once, so no character lookup hits the font again.
 static const int AsciiCount = 128;
 
-/// 解出 bytes[pos] 处的字符，返回它占几个字节。
-/// 自己动手解码而不是用 QTextCodec / QStringConverter：少一个依赖，也顺手保证
-/// "坏字节只吃一个字节"，绝不会读到半个字符上去
+/// Decode the character at bytes[pos], returning how many bytes it occupies.
+/// Hand rolled instead of QTextCodec/QStringConverter to avoid the extra
+/// dependency, and to guarantee that a broken byte only ever consumes one byte.
 static int decodeUtf8(const char *bytes, int size, int pos, uint32_t &code)
 {
     const unsigned char lead = static_cast<unsigned char>(bytes[pos]);
@@ -34,13 +34,13 @@ static int decodeUtf8(const char *bytes, int size, int pos, uint32_t &code)
         extra = 3;
         value = lead & 0x07u;
     } else {
-        // 孤立的续字节或者 0xF8 以上：当坏字节，只吃一个字节
+        // stray continuation byte or 0xF8 and above: treat as one bad byte
         code = 0xFFFD;
 
         return 1;
     }
 
-    // 尾巴不够长就直接认坏，不要越界读
+    // not enough bytes left, do not read past the end
     if (pos + extra >= size) {
         code = 0xFFFD;
 
@@ -50,7 +50,7 @@ static int decodeUtf8(const char *bytes, int size, int pos, uint32_t &code)
     for (int k = 1; k <= extra; k++) {
         const unsigned char next = static_cast<unsigned char>(bytes[pos + k]);
 
-        // 续字节必须形如 10xxxxxx
+        // continuation bytes must look like 10xxxxxx
         if ((next & 0xC0) != 0x80) {
             code = 0xFFFD;
 
@@ -65,7 +65,8 @@ static int decodeUtf8(const char *bytes, int size, int pos, uint32_t &code)
     return extra + 1;
 }
 
-/// 一个 UTF-8 字符占几个字节，输入是它的引导字节（坏字节也算一个）
+/// How many bytes the character starting with this lead byte occupies
+/// (a bad byte counts as one).
 static int utf8Length(unsigned char lead)
 {
     if (lead < 0x80) {
@@ -87,17 +88,17 @@ static int utf8Length(unsigned char lead)
     return 1;
 }
 
-/// 把一个码位追加到 UTF-16 字符串上
+/// Append one code point to a UTF-16 string.
 static void appendCodePoint(QString &out, uint32_t code)
 {
-    // 越过 Unicode 上限或者落在代理区：一律按替换字符处理，绝不产出非法 UTF-16
+    // beyond the Unicode range or inside the surrogate area: use the replacement
+    // character, never emit invalid UTF-16
     if (code > 0x10FFFFu || (code >= 0xD800u && code <= 0xDFFFu)) {
         code = 0xFFFD;
     }
 
     if (code >= 0x10000u) {
-        // 基本平面之外，拆成一对代理项。注意这里是两个 QChar，
-        // 它们在 visible 里仍然属于同一个定位单位（同一个 Loc）
+        // outside the BMP: two surrogate halves, but still ONE layout unit
         const uint32_t rest = code - 0x10000u;
 
         out.append(QChar(static_cast<char16_t>(0xD800u + (rest >> 10))));
@@ -117,7 +118,7 @@ LineMap::Metrics LineMap::makeMetrics(const QFontMetrics &fm)
     metrics.advance.resize(AsciiCount);
 
     for (int c = 0; c < AsciiCount; c++) {
-        // 制表符的"真实宽度"没有意义，位置交给下面的 tabWidth 统一处理
+        // the real width of a tab is meaningless, tabWidth handles it below
         int width = 0;
 
         if (c != '\t') {
@@ -129,16 +130,17 @@ LineMap::Metrics LineMap::makeMetrics(const QFontMetrics &fm)
         metrics.advance[c] = static_cast<quint16>(width);
     }
 
-    // 等宽字体里 'M' 和 '0' 一样宽，挑一个稳的当半角宽度
+    // in a monospace font 'M' and '0' are equally wide, prefer the safer one
     metrics.codeWidth = metrics.advance['M'] > 0 ? metrics.advance['M'] : metrics.advance['0'];
 
     if (metrics.codeWidth <= 0) {
-        // 字体什么都没量出来（极端情况），退回一个不会把界面撑坏的默认值
+        // the font reported nothing, fall back to a value that will not wreck the UI
         metrics.codeWidth = 8;
     }
 
-    // 制表符按 4 个半角宽度算。故意用固定宽度而不是"对齐到第 4 列"：
-    // 固定宽度才能保证"一个字符占多宽"只由它自己决定，缓存才立得住
+    // tabs use a fixed width on purpose (not "align to column 4"): a fixed width
+    // is what makes a character's width depend on itself alone, which is what
+    // keeps the cached block offsets valid
     metrics.tabWidth = metrics.codeWidth * 4;
 
     return metrics;
@@ -156,7 +158,7 @@ QString LineMap::decode(const std::string &text)
     int pos = 0;
 
     while (pos < size) {
-        // 快车道：ASCII 一字节一字符，超长纯英文行走的就是这里
+        // fast path: ASCII is one byte per character
         const unsigned char lead = static_cast<unsigned char>(bytes[pos]);
 
         if (lead < 0x80) {
@@ -176,8 +178,8 @@ QString LineMap::decode(const std::string &text)
     return out;
 }
 
-/// 表外字符的宽度：先查记忆表，没有再问字体，问完记住。
-/// 抽出来是因为 buildBlock() 里会反复量同一个汉字
+/// Width of a non-ASCII character: memoised, measured from the font on first use.
+/// Extracted because buildBlock() meets the same CJK character over and over.
 static int widthOfWideChar(const LineMap::Metrics &metrics, quint32 code)
 {
     if (metrics.wideAdvance.contains(code)) {
@@ -209,10 +211,11 @@ LineMap LineMap::build(quint32 lineBeginByte, const std::string &text, const Met
     map.m_byteLength = static_cast<quint32>(text.size());
     map.m_metrics = &metrics;
 
-    // 留一份自己的副本：视图随时来问定位，都不会读到已经被释放的字符串
+    // keep our own copy so the caller may free its string
     map.m_text = text;
 
-    // 铺字符表（顺便把可见文本铺出来）。宽度一个都不量，那是 ensureBuilt() 的事
+    // build the unit table (and the visible text with it); no width is measured
+    // here, that is ensureBuilt()'s job
     map.resetEntries();
 
     return map;
@@ -220,8 +223,8 @@ LineMap LineMap::build(quint32 lineBeginByte, const std::string &text, const Met
 
 void LineMap::refresh(const std::string &text)
 {
-    // 同一行被编辑过：文本换了，字符表和所有量测结果都得作废重建。
-    // 注意块表也要重建 —— 行的字节长度可能变了，块的数量跟着变
+    // the line was edited: the unit table and every measurement are stale.
+    // The block table is rebuilt too, since the byte length may have changed.
     m_text = text;
     m_byteLength = static_cast<quint32>(text.size());
 
@@ -230,7 +233,7 @@ void LineMap::refresh(const std::string &text)
 
 void LineMap::resetEntries()
 {
-    // 最坏情况每个字节一个字符，按字节数预留，后面不再扩容
+    // worst case one character per byte, reserve for that and never grow again
     const int rough = static_cast<int>(m_byteLength) + 1;
 
     m_byte.clear();
@@ -247,7 +250,7 @@ void LineMap::resetEntries()
     const char *bytes = m_text.data();
     const int size = static_cast<int>(m_text.size());
 
-    // 游标：已经处理到第几个字节，同时也是下一个定位单位的起始字节
+    // cursor: bytes processed so far, also the first byte of the next unit
     uint32_t pos = 0;
 
     while (static_cast<int>(pos) < size) {
@@ -263,8 +266,8 @@ void LineMap::resetEntries()
         }
 
         if (code == '\t') {
-            // 制表符：定位单位还是它自己，但屏幕上占 tabWidth 个像素，
-            // 也就是展开成 tabWidth / 半角宽度 个空格
+            // a tab is one unit, but occupies tabWidth pixels on screen, i.e. it
+            // expands to tabWidth / codeWidth spaces
             const int spaces = (m_metrics->codeWidth > 0) ? (m_metrics->tabWidth / m_metrics->codeWidth) : 4;
 
             m_visible.append(QString(std::max(0, spaces), QChar(u' ')));
@@ -278,14 +281,16 @@ void LineMap::resetEntries()
         pos += static_cast<uint32_t>(used);
     }
 
-    // 末尾补一个"收尾单位"：宽度固定为 0，字节列号就是行尾。
-    // 有了它，任何一列都能写成 [m_byte[i], m_byte[i+1]) 这样的半开区间，
-    // 全行最后一个字符也不用特殊照顾；它的左边缘正好就是这一行的宽度
+    // append a sentinel unit with width 0 whose byte column is the line end.
+    // With it every column is a half open interval [m_byte[i], m_byte[i+1]),
+    // so the last character needs no special case, and its left edge is the
+    // line width.
     m_byte.append(m_byteLength);
     m_char.append(static_cast<quint32>(m_visible.size()));
 
-    // 块表的骨架：长度只跟字节数有关，跟字符数无关。
-    // 注意 byteLength 正好等于块边界时会多出最后一块，那是给收尾单位准备的
+    // block skeleton: length depends on the byte count only. When byteLength
+    // lands exactly on a block edge this adds a trailing block, which is where
+    // the sentinel lives.
     const int blockCount = blockIndexForColumn(m_byteLength) + 1;
 
     for (int i = 0; i < blockCount; i++) {
@@ -299,7 +304,6 @@ void LineMap::resetEntries()
 
 int LineMap::blockIndexForColumn(quint32 byteColumn)
 {
-    // 块的起始字节 -> 块序号（按 EntrySpan 对齐，整除就是）
     return static_cast<int>(byteColumn / EntrySpan);
 }
 
@@ -319,9 +323,10 @@ quint32 LineMap::blockStartOf(int index) const
 
 int LineMap::firstEntryAtOrAfter(quint32 byteColumn) const
 {
-    // 因为 EntrySpan 是 2 的幂，"第 k*4096 个字节"这个位置正好就是第 k*4096 个
-    // 字符下标：下标小的那些字符必然都在它前面（多字节字符只会让下标更小）。
-    // 于是这里不需要从头扫，直接跳到块头再往右走几步
+    // EntrySpan is a power of two, so byte k*4096 is also character index
+    // k*4096: every character with a lower index starts before it (multi-byte
+    // characters only push indices further left). Hence we can jump straight to
+    // the block head and walk a few steps.
     int index = blockIndexForColumn(byteColumn) * static_cast<int>(EntrySpan);
 
     if (index > m_byte.size()) {
@@ -345,14 +350,15 @@ void LineMap::ensureBuilt(int index) const
         return;
     }
 
-    // 行尾所在的块一定是最后一块，一次量到那儿
+    // the line end always lives in the last block, so clamp instead of skipping
     if (index >= m_blocks.size()) {
         index = m_blocks.size() - 1;
     }
 
     while (m_built <= index) {
-        // 块头 x = 上一块的左边缘 + 上一块的宽度（第一块从 0 开始）。
-        // 块的起止字符由 buildBlock() 自己按字节边界算，不依赖任何跨块游标
+        // block head x = previous block's left edge + its width (0 for block 0).
+        // The character range of a block is derived from the byte edges inside
+        // buildBlock(), so no cross-block cursor state is needed.
         m_blocks[m_built].x = (m_built == 0) ? 0 : (m_blocks[m_built - 1].x + m_blocks[m_built - 1].width);
 
         buildBlock(m_built);
@@ -366,17 +372,18 @@ void LineMap::buildBlock(int index) const
     const quint32 start = blockStartOf(index);
     const quint32 end = blockEndColumn(index);
 
-    // 这一块从哪个字符开始：第一个字节能达到块起点的字符。
-    // 块边界可能切在汉字中间，那种字符归前面那一块，所以这里要的是"达到"
+    // First character of this block. A block edge may split a multi-byte
+    // character; such a character belongs to the earlier block, which is why
+    // this asks for "at or after".
     const int from = firstEntryAtOrAfter(start);
 
-    // 到哪里为止：第一个字节能达到块终点的字符
+    // one past the last character of this block
     const int stop = firstEntryAtOrAfter(end);
 
     m_blocks[index].startEntry = from;
     m_blocks[index].endEntry = stop;
 
-    // m_loc 用"相对块头的字节偏移"当下标，所以这一块要开多大先算清楚
+    // m_loc is indexed by the byte offset from the block head, size it first
     quint32 span = 0;
 
     if (stop > from && from < m_byte.size()) {
@@ -387,7 +394,7 @@ void LineMap::buildBlock(int index) const
         m_loc.resize(static_cast<int>(span));
     }
 
-    // 逐字符累加宽度。x 只记"相对块头"的偏移，Loc 里两个字段都是 4 字节，稳
+    // accumulate widths character by character; x is a block relative offset
     int x = 0;
 
     for (int i = from; i < stop; i++) {
@@ -401,8 +408,8 @@ void LineMap::buildBlock(int index) const
         int width = 0;
 
         if (at >= m_byteLength) {
-            // 收尾单位（行尾那一项）：宽度必须是 0。它的左边缘就是行宽，
-            // 再给它宽度的话 width() 会凭空多出一个字符
+            // the sentinel: width must stay 0, its left edge already is the line
+            // width; giving it a width would make width() one character too large
             width = 0;
         } else {
             const unsigned char lead = static_cast<unsigned char>(m_text[at]);
@@ -410,10 +417,9 @@ void LineMap::buildBlock(int index) const
             if (lead == '\t') {
                 width = m_metrics->tabWidth;
             } else if (lead < 0x80) {
-                // 半角字符查表，一次数组读取
                 width = m_metrics->advance[lead];
             } else {
-                // 多字节字符（汉字、全角标点…）才去问字体，而且问一次就记进表里
+                // non-ASCII: ask the font once per distinct character
                 uint32_t code = 0;
 
                 decodeUtf8(m_text.data(), static_cast<int>(m_text.size()), static_cast<int>(at), code);
@@ -426,7 +432,7 @@ void LineMap::buildBlock(int index) const
 
         loc.width = static_cast<quint32>(width);
 
-        // m_loc 的下标恒等于"相对块头的字节偏移"，所以块内定位是一次直接查表
+        // the index in m_loc is always the block relative byte offset
         const int slot = static_cast<int>(loc.byte);
 
         if (slot >= m_loc.size()) {
@@ -435,26 +441,29 @@ void LineMap::buildBlock(int index) const
 
         m_loc[slot] = loc;
 
-        // 下一个字符的左边缘 = 这个字符的左边缘 + 它自己的宽度
+        // next character's left edge = this one's left edge + its width
         x += width;
     }
 
-    // 这一块的宽度 = 最后一个字符的相对 x + 它的宽度
+    // block width = relative x of the last character + that character's width
     if (stop > from && from < m_byte.size()) {
         const quint32 offset = m_byte[stop - 1] - start;
 
-        m_blocks[index].width = (offset < static_cast<quint32>(m_loc.size()))
-                                    ? static_cast<int>(m_loc[static_cast<int>(offset)].x + m_loc[static_cast<int>(offset)].width)
-                                    : 0;
+        m_blocks[index].width =
+            (offset < static_cast<quint32>(m_loc.size()))
+                ? static_cast<int>(m_loc[static_cast<int>(offset)].x + m_loc[static_cast<int>(offset)].width)
+                : 0;
     } else {
-        // 空块（整行已被前面的块覆盖完）：没有宽度，但 x 仍然会被下一块接上
+        // empty block (the line was already covered): no width, but its x is
+        // still the anchor the next block builds on
         m_blocks[index].width = 0;
     }
 }
 
 const LineMap::Loc &LineMap::locAt(int index) const
 {
-    // 块内定位：先整除到块，再按"相对块头的字节偏移"直接查表，全程没有前缀和
+    // in-block lookup: one division to the block, then index by the byte offset
+    // from the block head. No prefix sums anywhere.
     const int block = blockIndexForColumn(m_byte[index]);
 
     assert(block >= 0 && block < m_built);
@@ -476,7 +485,7 @@ int LineMap::xAtEntry(int index) const
     }
 
     if (index >= total - 1) {
-        // 行尾（含收尾单位）：行宽就是它的左边缘
+        // line end (and the sentinel): the line width is its left edge
         return width();
     }
 
@@ -488,7 +497,7 @@ int LineMap::xAtEntry(int index) const
 
     ensureBuilt(block);
 
-    // 块内 x 是"相对块头"的，所以这里是块头 x 加块内偏移
+    // the in-block offset is block relative, so add the block head
     return m_blocks[block].x + static_cast<int>(locAt(index).x);
 }
 
@@ -498,8 +507,9 @@ int LineMap::width() const
         return 0;
     }
 
-    // 行宽要到最后一块才数得出来，所以这里会把整行量完。只在一行的"总宽"真的
-    // 被需要时才发生（算横向滚动范围）；定点定位 xAtColumn / columnAtX 不会走到这里
+    // the line width needs the last block, so this measures the whole line. It
+    // only happens when the total width is really needed (horizontal scroll
+    // range); point queries through xAtColumn()/columnAtX() never get here.
     ensureBuilt(static_cast<int>(m_blocks.size()) - 1);
 
     int total = 0;
@@ -522,7 +532,7 @@ int LineMap::entryAtByte(quint32 byteColumn) const
     const int block = blockIndexForColumn(byteColumn);
 
     if (block >= m_blocks.size()) {
-        // 行尾之后：落在收尾单位上，也就是行尾列号
+        // past the line end: the sentinel unit, i.e. the line-end column
         return total - 1;
     }
 
@@ -534,7 +544,7 @@ int LineMap::entryAtByte(quint32 byteColumn) const
         index = 0;
     }
 
-    // 块内走几步就够：块的起止字符是记好的，不用从行首找
+    // a few steps inside the block are enough, its first character is recorded
     while (index < total - 1 && m_byte[index + 1] <= byteColumn) {
         index++;
     }
@@ -547,7 +557,7 @@ quint32 LineMap::byteAtEntry(int index) const
     const int total = m_byte.size();
 
     if (total == 0 || index >= total - 1) {
-        // 收尾单位，或者说行尾之后：列号就是整行字节数
+        // the sentinel, or past the line end: the column is the line length
         return m_byteLength;
     }
 
@@ -579,11 +589,10 @@ int LineMap::charIndexAtEntry(int index) const
 
 int LineMap::xAtColumn(quint32 byteColumn) const
 {
-    // 一次整除跳到目标所在的块，块内查一次。全程没有前缀和数组
     const int entry = entryAtByte(byteColumn);
 
     if (entry >= m_byte.size() - 1) {
-        // 行尾：直接要行宽，别去问那个收尾单位（它的 x 没有意义）
+        // line end: ask for the width, the sentinel's own x is meaningless
         return width();
     }
 
@@ -598,8 +607,9 @@ int LineMap::entryAtX(int x) const
         return 0;
     }
 
-    // ---- 粗定位：在块表上二分，找最后一个"左边缘不超过目标"的块 ----
-    // 块表长度是 行字节数/4096，比字符数小了好几个数量级
+    // coarse step: binary search the last block whose left edge is not right of
+    // x. The table is "line bytes / 4096" long, orders of magnitude below the
+    // character count.
     int low = 0;
     int high = static_cast<int>(m_blocks.size()) - 1;
     int block = 0;
@@ -608,7 +618,7 @@ int LineMap::entryAtX(int x) const
         const int mid = low + (high - low) / 2;
         const int blockX = (mid < m_built) ? m_blocks[mid].x : -1;
 
-        // 还没量到的块一定是空的，往左找
+        // unmeasured blocks come later, so search left
         if (blockX >= 0 && blockX <= x) {
             block = mid;
             low = mid + 1;
@@ -617,7 +627,7 @@ int LineMap::entryAtX(int x) const
         }
     }
 
-    // ---- 细定位：只把这一块量出来，然后在块内走 ----
+    // fine step: measure this block only, then walk inside it
     ensureBuilt(block);
 
     const int from = std::max(0, m_blocks[block].startEntry);
@@ -626,14 +636,54 @@ int LineMap::entryAtX(int x) const
 
     int index = from;
 
-    // 停在"最后一个左边缘仍在 x 左边的字符"上。这里必须能停在最后那个字符上：
-    // 早先写成 index + 1 < to 配合"右边缘超过 x 就 break"，结果点在一行最右边
-    // 时永远停在倒数第二个字符上，整行光标右移一位
+    // stop on the last character whose left edge is still left of x. The bound
+    // must allow reaching the last character of the line; an earlier version
+    // stopped at the second to last one, which shifted the caret by one.
     while (index + 1 < to && blockX + static_cast<int>(locAt(index + 1).x) <= x) {
         index++;
     }
 
     return index;
+}
+
+void LineMap::windowForX(int leftX, int rightX, int &firstEntry, int &lastEntry) const
+{
+    const int total = m_byte.size();
+    const int last = total - 1;  // index of the sentinel unit
+
+    if (total <= 1) {
+        firstEntry = 0;
+        lastEntry = total;
+
+        return;
+    }
+
+    // start: first character whose left edge reaches leftX. This must go through
+    // entryAtX(), which measures the block on demand and returns an exact
+    // character index.
+    int first = entryAtX(std::max(0, leftX));
+
+    if (first < 0) {
+        first = 0;
+    }
+
+    if (first > last) {
+        first = last;
+    }
+
+    // end: the character whose right edge passes rightX, plus one
+    int stop = entryAtX(std::max(0, rightX)) + 2;
+
+    if (stop > last) {
+        stop = last;
+    }
+
+    if (stop <= first) {
+        stop = std::min(last, first + 1);
+    }
+
+    firstEntry = first;
+    lastEntry = stop;
 }
 
 quint32 LineMap::columnAtX(int x) const
@@ -646,7 +696,7 @@ quint32 LineMap::columnAtX(int x) const
     }
 
     if (index >= total - 1) {
-        // 点在这一行最后一个字符的右边：光标停在行尾
+        // right of the last character: the caret goes to the line end
         return m_byteLength;
     }
 
@@ -654,12 +704,13 @@ quint32 LineMap::columnAtX(int x) const
     const Loc &loc = locAt(index);
     const int left = m_blocks[block].x + static_cast<int>(loc.x);
 
-    // 半个字符以内贴左边缘
+    // within half a character: snap to the left edge
     if (x - left < static_cast<int>(loc.width) / 2) {
         return m_byte[index];
     }
 
-    // 超过半个字符：贴右边缘，也就是下一个字符的起点（最后一个字符就是行尾）
+    // past half a character: snap right, i.e. to the next character's start
+    // (for the last character that is the line end)
     if (index + 1 < total) {
         return m_byte[index + 1];
     }
