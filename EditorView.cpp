@@ -12,17 +12,27 @@
 #include <QScrollBar>
 #include <QWheelEvent>
 
+#include <QtGlobal>
+
+// QInputMethodEvent lives in QtGui on Qt6 and in QtCore on Qt5;
+// this include works for either
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+#include <QInputMethodEvent>
+#else
+#include <QtCore/QInputMethodEvent>
+#endif
+
 #include <algorithm>
 
 namespace
 {
-/// 光标闪烁的半周期，和 Windows 自带的一致
+/// Half period of the caret blink, same as the Windows default
 const int CaretBlinkMs = 530;
 
-/// 行号栏和正文之间空一点
+/// Gap between the gutter and the text
 const int GutterGap = 8;
 
-/// 算横向滚动范围时最多采多少行。见 updateScrollBars() 里的说明
+/// Lines sampled when computing the horizontal scroll range (see updateScrollBars)
 const quint32 WidthSampleTarget = 64;
 }
 
@@ -41,8 +51,8 @@ quint32 EditorView::clampU32(qint64 v, quint32 low, quint32 high)
 
 std::string EditorView::toUtf8(const QString &text)
 {
-    // 自己编码，不依赖 QTextCodec / QStringConverter：那两个在 Qt5 和 Qt6 之间
-    // 换了名字，而 UTF-8 的规则一共就那几条
+    // Hand rolled to avoid QTextCodec / QStringConverter: they changed name
+    // between Qt5 and Qt6, and UTF-8 has only a handful of rules.
     std::string out;
 
     out.reserve(static_cast<size_t>(text.size()) * 3 / 2 + 4);
@@ -50,7 +60,7 @@ std::string EditorView::toUtf8(const QString &text)
     for (int i = 0; i < text.size(); i++) {
         uint32_t code = text.at(i).unicode();
 
-        // 高低代理项凑成一个码位，缺一半就当替换字符
+        // combine a surrogate pair into one code point, a lone half is invalid
         if (code >= 0xD800u && code <= 0xDBFFu) {
             if (i + 1 < text.size()) {
                 const uint32_t low = text.at(i + 1).unicode();
@@ -96,7 +106,7 @@ quint32 EditorView::stepBack(const std::string &text, quint32 offset)
 
     quint32 at = offset - 1;
 
-    // 往回吃掉续字节（10xxxxxx），一直退到这个字符的起始字节
+    // eat the continuation bytes (10xxxxxx) back to the leading byte
     while (at > 0 && (static_cast<unsigned char>(text[at]) & 0xC0) == 0x80) {
         at--;
     }
@@ -127,17 +137,41 @@ quint32 EditorView::stepForward(const std::string &text, quint32 offset)
     return (next > text.size()) ? static_cast<quint32>(text.size()) : next;
 }
 
+/// Build the body font. Consolas only, as required.
+/// A function because QFontMetrics has no default constructor: it must be
+/// constructed in EditorView's init list from an already configured QFont, so
+/// the font cannot be configured inside the constructor body. This also keeps
+/// m_font and m_fontMetrics on the same font.
+static QFont makeEditorFont()
+{
+    QFont font(QStringLiteral("Consolas"), 11);
+
+    font.setStyleHint(QFont::Monospace);
+    font.setFixedPitch(true);
+
+    return font;
+}
+
 EditorView::EditorView(QWidget *parent)
     : QAbstractScrollArea(parent)
+    , m_font(makeEditorFont())
+    , m_fontMetrics(m_font)
 {
-    // 滚动条我们自己在 updateScrollBars() 里管，Qt 默认会按 sizeHint 乱冒
-    setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    // Visibility is Qt's business: the policy is AsNeeded and Qt decides from
+    // range / pageStep. Do NOT switch to AlwaysOff and call setVisible() by hand:
+    // under AlwaysOff Qt's own _q_showOrHideScrollBars() keeps hiding the bar and
+    // overrides our call, so the scrollbar would never appear.
+    setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     setFocusPolicy(Qt::StrongFocus);
 
     viewport()->setCursor(Qt::IBeamCursor);
 
-    // 配色：白底黑字，行号栏浅灰，选中蓝，和常见编辑器一致
+    // Tell the input method this view accepts committed text, otherwise a Chinese
+    // IME never sends QInputMethodEvent here and CJK input is lost
+    viewport()->setAttribute(Qt::WA_InputMethodEnabled, true);
+
+    // the usual editor palette: white page, light gutter, blue selection
     m_background = QColor(0xFF, 0xFF, 0xFF);
     m_gutterColor = QColor(0xF3, 0xF3, 0xF3);
     m_gutterText = QColor(0x99, 0x99, 0x99);
@@ -145,6 +179,7 @@ EditorView::EditorView(QWidget *parent)
     m_selectionColor = QColor(0xCF, 0xE2, 0xFF);
     m_caretColor = QColor(0x00, 0x00, 0x00);
 
+    // the font is ready, this only derives the geometry from it
     setupFont();
 
     connect(verticalScrollBar(), &QScrollBar::valueChanged, this, [this](int) {
@@ -161,29 +196,27 @@ EditorView::EditorView(QWidget *parent)
 
 void EditorView::setupFont()
 {
-    // 题目的硬性要求：只用 Windows 自带的 Consolas。
-    // 这里的 styleHint / fixedPitch 只是让字体匹配更稳，不是跨平台逻辑
-    m_font = QFont(QStringLiteral("Consolas"), 11);
-    m_font.setStyleHint(QFont::Monospace);
-    m_font.setFixedPitch(true);
-
+    // The font comes from the init list (see makeEditorFont): m_font and
+    // m_fontMetrics must not be reassigned here, QFontMetrics has no default
+    // constructor and can only be built in an init list. To change the size,
+    // edit the 11 inside makeEditorFont().
     setFont(m_font);
 
-    const QFontMetrics fm(m_font);
+    // ASCII advances are measured once; CJK glyphs are measured when their block
+    // is first needed. LineMap keeps a pointer to m_fontMetrics, so this member
+    // must outlive every LineMap -- never hand it a local object.
+    m_metrics = LineMap::makeMetrics(m_fontMetrics);
 
-    // ASCII 的推进量一次测好；汉字之类的等真正量到那一块时再问字体
-    m_metrics = LineMap::makeMetrics(fm);
-
-    m_ascent = fm.ascent();
-    m_lineHeight = fm.height() + 2;
-    m_digitWidth = std::max(1, fm.horizontalAdvance(QChar(u'0')));
+    m_ascent = m_fontMetrics.ascent();
+    m_lineHeight = m_fontMetrics.height() + 2;
+    m_digitWidth = std::max(1, m_fontMetrics.horizontalAdvance(QChar(u'0')));
     m_gutter = m_digitWidth * 6 + GutterGap * 2;
 
-    // 光标比一整行矮一点，上下各留一个像素，看着像个竖线而不是一根柱子
-    m_caretHeight = std::min(m_lineHeight - 2, fm.ascent() + fm.descent());
+    // a caret slightly shorter than the line reads as a bar, not a column
+    m_caretHeight = std::min(m_lineHeight - 2, m_fontMetrics.ascent() + m_fontMetrics.descent());
     m_caretTop = (m_lineHeight - m_caretHeight) / 2;
 
-    // 字号一变，所有按像素算出来的东西都得重来
+    // everything measured in pixels depends on the font, so drop the caches
     m_lines.clear();
     m_widths.clear();
 
@@ -216,14 +249,10 @@ void EditorView::resetView()
 
     verticalScrollBar()->setValue(0);
     horizontalScrollBar()->setValue(0);
-
     updateScrollBars();
-
     m_blinkOn = true;
     m_blinkTimer.start();
-
     viewport()->update();
-
     emit cursorMoved();
 }
 
@@ -253,6 +282,47 @@ Position EditorView::cursorPosition() const
     return text->positionOf(m_cursor);
 }
 
+void EditorView::snapCursorToCharBoundary()
+{
+    TextBuffer *text = buffer();
+
+    if (text == nullptr) {
+        return;
+    }
+
+    m_cursor = clampU32(m_cursor, 0, text->byteCount());
+
+    if (m_cursor == 0) {
+        return;
+    }
+
+    // one byte to the left is enough: a continuation byte means the caret sits
+    // inside a character, so step back to that character's leading byte
+    const std::string left = text->range(m_cursor - 1, m_cursor);
+
+    if (!left.empty() && (static_cast<unsigned char>(left[0]) & 0xC0) == 0x80) {
+        m_cursor = stepBack(text->range(0, m_cursor), m_cursor);
+    }
+}
+
+void EditorView::inputMethodEvent(QInputMethodEvent *event)
+{
+    // A Chinese IME: the preedit (uncommitted pinyin) is not painted here, the
+    // committed text goes straight in. Only commitString is handled; the preedit
+    // is dropped, so candidates are invisible but CJK text does reach the buffer.
+    if (!event->commitString().isEmpty()) {
+        insertText(event->commitString());
+
+        event->accept();
+
+        return;
+    }
+
+    // preedit-only update: nothing to insert, but accept it instead of passing
+    // an unhandled event up the chain
+    event->accept();
+}
+
 void EditorView::insertText(const QString &text)
 {
     m_blinkOn = true;
@@ -268,7 +338,12 @@ void EditorView::insertText(const QString &text)
 
     TextBuffer *text_ = document->buffer();
 
-    // 有选中就用新内容替掉，这正是所有编辑器里"打字覆盖选中"的行为
+    // the caret must sit on a character boundary first, or the insert point lands
+    // inside a CJK character
+    snapCursorToCharBoundary();
+
+    // a selection is replaced by the new text: the usual "typing overwrites the
+    // selection" behaviour
     if (m_anchor != m_cursor) {
         const quint32 from = std::min(m_anchor, m_cursor);
         const quint32 to = std::max(m_anchor, m_cursor);
@@ -276,16 +351,20 @@ void EditorView::insertText(const QString &text)
         text_->replace(from, to, bytes);
         m_cursor = from;
     } else {
-        text_->insert(m_cursor, bytes);
-        m_cursor += static_cast<quint32>(bytes.size());
+        // move the caret by what the buffer really inserted. bytes.size() is not
+        // reliable: CRLF is normalised to LF and shrinks (defensive here, the GUI
+        // inserts one character at a time)
+        const quint32 added = text_->insert(m_cursor, bytes);
+
+        m_cursor += (added > 0) ? added : static_cast<quint32>(bytes.size());
     }
 
     m_anchor = m_cursor;
     m_selecting = false;
     m_modified = true;
 
-    // 内容变了，这一行的定位表（块索引）和宽度都不能再信。
-    // 注意：不能整体清空缓存 —— 行号没变的那些行内容也没变，清掉纯属浪费
+    // the index and width of this line are stale now. Do not clear the whole
+    // cache: lines before it keep their number and content
     forgetFrom(m_cursor);
     updateScrollBars();
     ensureCursorVisible();
@@ -303,15 +382,15 @@ void EditorView::forgetFrom(quint32 offset)
         return;
     }
 
-    // 被改动的那一行：它自己的定位表必须作废（长度可能都变了）
+    // the edited line: its index is invalid (its length may have changed)
     const quint32 line = findLine(offset, m_lineHint);
 
     m_lines.remove(line);
     m_widths.remove(line);
 
-    // 后面的行：即使内容没变，行号也可能整体错位了，统统丢掉让它们按需重建。
-    // 前缀部分（0 .. line-1）保持不动，所以在一百万行的长文档里编辑一行，
-    // 不会被无关的行拖累
+    // Later lines: their content may be unchanged but their numbers shifted, so
+    // drop them all and rebuild on demand. The prefix 0..line-1 is kept, so
+    // editing one line in a million line document costs nothing for the rest.
     for (QHash<quint32, LineMap>::iterator it = m_lines.begin(); it != m_lines.end();) {
         if (it.key() > line) {
             it = m_lines.erase(it);
@@ -331,12 +410,12 @@ void EditorView::forgetFrom(quint32 offset)
     m_lineHint = line;
 }
 
-// ============================== 定位与缓存 ==============================
+// ============================== lookup and caches ==============================
 
 const LineMap &EditorView::lineMap(quint32 line)
 {
-    // QHash 里已经有了就直接用。注意：调用方必须"拿到引用立刻用完"，
-    // 因为下面可能插入新的行，那会让 QHash 重新散列
+    // Reuse the cached index. The caller must consume the reference immediately:
+    // inserting another line can rehash the QHash and invalidate it.
     QHash<quint32, LineMap>::iterator it = m_lines.find(line);
 
     if (it != m_lines.end()) {
@@ -358,17 +437,8 @@ LineMap EditorView::buildLineMap(quint32 line)
         return LineMap::build(0, std::string(), m_metrics);
     }
 
-    // 只取这一行的字节；行内的块划分都在 LineMap 里完成
+    // only this line's bytes; the block split happens inside LineMap
     return LineMap::build(text->lineBegin(line), text->lineText(line), m_metrics);
-}
-
-void EditorView::setScrollBarVisible(QScrollBar *bar, bool visible)
-{
-    // 只在真的要变的时候才动它：setVisible 会让 QAbstractScrollArea 重算视口边距，
-    // 而视口一变又会回到这里，来回设同一个值就可能绕成死循环
-    if (bar->isVisible() != visible) {
-        bar->setVisible(visible);
-    }
 }
 
 int EditorView::lineWidth(quint32 line)
@@ -379,7 +449,7 @@ int EditorView::lineWidth(quint32 line)
         return it.value();
     }
 
-    // width() 会把这一行整行量完，所以结果一定要缓存住
+    // width() measures the whole line, so the result must be cached
     const int width = lineMap(line).width();
 
     m_widths.insert(line, width);
@@ -400,13 +470,13 @@ quint32 EditorView::findLine(quint32 offset, quint32 idea)
     offset = clampU32(offset, 0, text->byteCount());
     idea = std::min(idea, total - 1);
 
-    // 先看出发点对不对，这是绝大多数情况（光标没跨行）
+    // the hint line is right in the common case (the caret did not leave the line)
     if (isLineOf(lineBeginOf(idea), lineEndOf(idea), offset)) {
         return idea;
     }
 
-    // 不对就从一行的窗口开始往两边翻倍，直到把 offset 套住。
-    // 上下移动几行只要看几行，跳到文件另一头也只是 O(log 行数) 次
+    // otherwise grow a window from one line outwards until it brackets offset.
+    // moving a few lines touches a few lines, crossing the file is O(log lines)
     quint32 low = idea;
     quint32 high = idea;
     quint32 span = 1;
@@ -433,14 +503,14 @@ quint32 EditorView::findLine(quint32 offset, quint32 idea)
         }
 
         if (!grown) {
-            // 头尾都到边了还没套住，那一定落在最后一行
+            // both ends reached without a hit: offset must be in the last line
             return total - 1;
         }
 
         span *= 2;
     }
 
-    // 窗口不大（最多 span 行），逐行找就行
+    // the window is small (at most span lines), a linear scan is fine
     for (quint32 line = low; line <= high; line++) {
         if (offset <= text->lineEnd(line)) {
             return line;
@@ -479,7 +549,7 @@ EditorView::CaretSpan EditorView::caretSpan()
         return span;
     }
 
-    // findLine 有 m_lineHint 当出发点，光标没跨行时基本是常数时间
+    // findLine starts from m_lineHint, so inside one line this is near constant time
     span.line = findLine(m_cursor, m_lineHint);
 
     m_lineHint = span.line;
@@ -537,7 +607,7 @@ void EditorView::afterMove()
     emit cursorMoved();
 }
 
-// ============================== 键盘 ==============================
+// ============================== keyboard ==============================
 
 void EditorView::keyPressEvent(QKeyEvent *event)
 {
@@ -581,8 +651,8 @@ void EditorView::keyPressEvent(QKeyEvent *event)
         const int step = (key == Qt::Key_Up) ? -1 : 1;
         const CaretSpan span = caretSpan();
 
-        // 目标列取"原来的列"和"目标行的字节长度"里小的那个。
-        // 因为列号每次都是从光标现算的，列号不会被短行永久吃掉
+        // target column = min(old column, byte length of the target line).
+        // The column is derived from the caret every time, so a short line cannot eat it.
         const quint32 line = clampU32(static_cast<qint64>(span.line) + step, 0, text->lineCount() - 1);
         const quint32 column = std::min(span.column, lineByteLength(line));
 
@@ -592,27 +662,9 @@ void EditorView::keyPressEvent(QKeyEvent *event)
         return;
     }
 
-    case Qt::Key_Home: {
-        const quint32 line = control ? 0 : caretSpan().line;
-
-        moveTo(line, 0, keep);
-        afterMove();
-
-        return;
-    }
-
-    case Qt::Key_End: {
-        const quint32 line = control ? (text->lineCount() - 1) : caretSpan().line;
-
-        moveTo(line, lineByteLength(line), keep);
-        afterMove();
-
-        return;
-    }
-
     case Qt::Key_PageUp:
     case Qt::Key_PageDown: {
-        // 翻一屏，同时保持横向列不动（和上下移动一个道理）
+        // one screen up/down, keeping the column like the arrow keys
         const int rows = std::max(1, viewport()->height() / m_lineHeight);
         const int step = (key == Qt::Key_PageUp) ? -rows : rows;
         const CaretSpan span = caretSpan();
@@ -649,8 +701,8 @@ void EditorView::keyPressEvent(QKeyEvent *event)
         const quint32 line = findLine(m_cursor, m_lineHint);
         const quint32 begin = text->lineBegin(line);
 
-        // 在行首按退格 = 把上一行的换行符吃掉，也就是两行接上。
-        // 行内退格则只退一个字符（UTF-8 的多字节字符一起退）
+        // backspace at the line start eats the newline and joins two lines;
+        // inside a line it removes exactly one character (a whole UTF-8 sequence)
         const quint32 previous = (m_cursor > begin) ? stepBack(text->range(begin, m_cursor), m_cursor - begin) + begin
                                                     : m_cursor - 1;
 
@@ -683,6 +735,24 @@ void EditorView::keyPressEvent(QKeyEvent *event)
         return;
     }
 
+    case Qt::Key_Home: {
+        const quint32 line = control ? 0 : caretSpan().line;
+
+        moveTo(line, 0, keep);
+        afterMove();
+
+        return;
+    }
+
+    case Qt::Key_End: {
+        const quint32 line = control ? (text->lineCount() - 1) : caretSpan().line;
+
+        moveTo(line, lineByteLength(line), keep);
+        afterMove();
+
+        return;
+    }
+
     case Qt::Key_Return:
     case Qt::Key_Enter:
         insertText(QStringLiteral("\n"));
@@ -698,40 +768,10 @@ void EditorView::keyPressEvent(QKeyEvent *event)
         break;
     }
 
-    // ---- 快捷键 ----
-    if (control) {
-        if (key == Qt::Key_A) {
-            m_anchor = 0;
-            m_cursor = text->byteCount();
-
-            afterMove();
-
-            return;
-        }
-
-        if (key == Qt::Key_C) {
-            copyToClipboard(false);
-
-            return;
-        }
-
-        if (key == Qt::Key_X) {
-            copyToClipboard(true);
-
-            return;
-        }
-
-        if (key == Qt::Key_V) {
-            pasteFromClipboard();
-
-            return;
-        }
-    }
-
-    // ---- 普通输入 ----
-    // 这里只看 text()：Ctrl 组合键的 text() 是控制字符，直接忽略。
-    // 唯一要放行的是 Ctrl+Alt（Windows 上 AltGr 就是这个组合），
-    // 有些键盘布局要靠它打字符
+    // ---- plain text input ----
+    // Only text() matters here: a Ctrl chord carries a control character and is
+    // ignored. The one exception is Ctrl+Alt (AltGr on Windows), which some
+    // keyboard layouts need in order to type characters.
     const bool textInput = !event->text().isEmpty()
                            && (!control || (event->modifiers() & Qt::AltModifier) != 0)
                            && event->text().at(0).unicode() >= 0x20;
@@ -751,13 +791,13 @@ void EditorView::moveCaret(TextBuffer *text, int direction, bool keepSelection)
 
     if (direction < 0) {
         if (span.column > 0) {
-            // 行内左移：只取光标左边那一小段，跨过整个 UTF-8 字符
+            // one character left inside the line, over the whole UTF-8 sequence
             const quint32 begin = text->lineBegin(span.line);
             const std::string part = text->range(begin, m_cursor);
 
             moveTo(span.line, stepBack(part, span.column), keepSelection);
         } else if (span.line > 0) {
-            // 行首左移：跳到上一行的行尾
+            // at the line start: jump to the end of the previous line
             const quint32 previous = span.line - 1;
 
             moveTo(previous, lineByteLength(previous), keepSelection);
@@ -771,7 +811,7 @@ void EditorView::moveCaret(TextBuffer *text, int direction, bool keepSelection)
     const quint32 length = lineByteLength(span.line);
 
     if (span.column < length) {
-        // 行内右移：只取光标右边那一小段
+        // one character right inside the line
         const quint32 begin = text->lineBegin(span.line);
         const std::string part = text->range(m_cursor, begin + length + 1);
 
@@ -781,15 +821,15 @@ void EditorView::moveCaret(TextBuffer *text, int direction, bool keepSelection)
     }
 
     if (span.line + 1 < text->lineCount()) {
-        // 行尾右移：跳到下一行的行首
+        // at the line end: jump to the start of the next line
         moveTo(span.line + 1, 0, keepSelection);
     }
 }
 
 quint32 EditorView::caretWordOffset(TextBuffer *text, bool forward)
 {
-    // 单词跳转：把字符分成"空白 / 词字符 / 其它标点"三类，同类连续算一段。
-    // 只看光标附近的那一段文本，不整份文档拖出来
+    // Word jump: characters are blank / word / punctuation, and a run of one
+    // class is one word. Only the text around the caret is examined.
     const auto classify = [](unsigned char c) {
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
             return 0;
@@ -835,7 +875,7 @@ quint32 EditorView::caretWordOffset(TextBuffer *text, bool forward)
         return m_cursor;
     }
 
-    // 先退掉紧跟在光标左边的续字节，保证起点落在字符边界上
+    // step over the continuation bytes left of the caret to land on a boundary
     const unsigned char kind = static_cast<unsigned char>(classify(static_cast<unsigned char>(part[at - 1])));
 
     while (at > 0 && static_cast<unsigned char>(classify(static_cast<unsigned char>(part[at - 1]))) == kind) {
@@ -869,7 +909,7 @@ void EditorView::deleteRange(quint32 from, quint32 to)
     m_selecting = false;
     m_modified = true;
 
-    // 改动点之后的行号可能整体错位，缓存必须从这一行开始作废
+    // line numbers after the edit may shift, so drop the cache from this line on
     forgetFrom(from);
     updateScrollBars();
     afterMove();
@@ -886,7 +926,7 @@ QString EditorView::selectionText()
     const quint32 from = std::min(m_anchor, m_cursor);
     const quint32 to = std::max(m_anchor, m_cursor);
 
-    // 缓冲区里只有 '\n'，剪贴板里的换行要的是 CRLF，这里补上
+    // the buffer holds only \n, the clipboard wants CRLF
     QString out = LineMap::decode(text->range(from, to));
 
     out.replace(QStringLiteral("\n"), QStringLiteral("\r\n"));
@@ -894,35 +934,11 @@ QString EditorView::selectionText()
     return out;
 }
 
-void EditorView::copyToClipboard(bool cut)
-{
-    const QString selected = selectionText();
-
-    if (selected.isEmpty()) {
-        return;
-    }
-
-    QGuiApplication::clipboard()->setText(selected);
-
-    if (cut) {
-        deleteRange(std::min(m_anchor, m_cursor), std::max(m_anchor, m_cursor));
-    }
-}
-
-void EditorView::pasteFromClipboard()
-{
-    const QString content = QGuiApplication::clipboard()->text();
-
-    if (!content.isEmpty()) {
-        // 粘贴的内容可能带 CRLF，交给 TextBuffer::insert() 折成 LF
-        insertText(content);
-    }
-}
-
 int EditorView::caretPixelX(quint32 line, quint32 column)
 {
-    // 光标画在字符的左边缘：一次整除跳到块里，块内查一次就出 x。
-    // 这一行几百万个字符也无所谓，因为被量过的块一直只有屏幕上那一两块
+    // The caret sits on the left edge of a character: one division into the block
+    // plus one lookup. Millions of characters per line are fine, only the blocks
+    // on screen were ever measured.
     return lineMap(line).xAtColumn(column);
 }
 
@@ -946,7 +962,7 @@ void EditorView::ensureCursorVisible()
 
     const int x = caretPixelX(line, position.column);
 
-    // ---- 竖向：上下各留一行的余量 ----
+    // vertical: keep one line of slack above and below
     QScrollBar *vertical = verticalScrollBar();
 
     const int lineTop = static_cast<int>(line) * m_lineHeight;
@@ -958,7 +974,8 @@ void EditorView::ensureCursorVisible()
         vertical->setValue(std::max(0, lineTop + m_lineHeight * 2 - viewHeight));
     }
 
-    // ---- 横向：只保证"看得见"，不居中，免得打字时光标乱跳 ----
+    // horizontal: keep the caret merely visible, do not centre it, so typing does
+    // not make the view jump
     QScrollBar *horizontal = horizontalScrollBar();
 
     const int left = horizontal->value();
@@ -971,12 +988,12 @@ void EditorView::ensureCursorVisible()
     }
 }
 
-// ============================== 滚动 ==============================
+// ============================== scrolling ==============================
 
 void EditorView::updateScrollBars()
 {
-    // 这个函数会改滚动条可见性，从而改变视口大小；视口变化又会触发 resizeEvent
-    // 再调这里。加个守卫，避免两个方向来回打架
+    // Changing range / pageStep can make Qt show a scrollbar, which resizes the
+    // viewport and calls back into resizeEvent -> here. The guard stops the loop.
     if (m_reflowGuard) {
         return;
     }
@@ -991,8 +1008,6 @@ void EditorView::updateScrollBars()
     if (text == nullptr) {
         vertical->setRange(0, 0);
         horizontal->setRange(0, 0);
-        setScrollBarVisible(vertical, false);
-        setScrollBarVisible(horizontal, false);
 
         m_reflowGuard = false;
 
@@ -1002,27 +1017,26 @@ void EditorView::updateScrollBars()
     const int viewWidth = viewport()->width();
     const int viewHeight = viewport()->height();
 
-    // ---- 竖向 ----
+    // ---- vertical ----
     const qint64 documentHeight = static_cast<qint64>(text->lineCount()) * m_lineHeight;
     const int lineCount = static_cast<int>(text->lineCount());
 
-    // 行号栏宽度按"最大行号有几位"留出来，行数变了就跟着变
+    // the gutter must fit the widest line number, so it tracks the line count
     const int digits = QString::number(std::max(1, lineCount)).size();
 
     m_gutter = std::max(m_digitWidth * 3, m_digitWidth * digits + GutterGap * 2);
 
+    // visibility is Qt's business: AsNeeded decides from range / pageStep
     vertical->setRange(0, static_cast<int>(std::max<qint64>(0, documentHeight - viewHeight)));
     vertical->setPageStep(std::max(1, viewHeight));
     vertical->setSingleStep(m_lineHeight);
-    setScrollBarVisible(vertical, documentHeight > viewHeight);
 
-    // ---- 横向 ----
-    // 这里没有维护"全文档最宽行"的全局统计（那需要改动 TextBuffer，或者每次编辑
-    // 都全量重算）。改成采样：按均匀步长取 WidthSampleTarget 行，再单独算上最后
-    // 一行。超长单行的文件通常就那么一两行，必然被采到；普通源码文件里各行宽度本来
-    // 就差不多，采样出来的滚动范围足够用
-    // 代价说清楚：采样那一行如果很长，lineWidth() 会把它整行量完，一次约几十毫秒
-    // （一百万个字符）。这是"不改动核心数据结构"换来的取舍
+    // ---- horizontal ----
+    // There is no global widest-line statistic: keeping one would either modify
+    // TextBuffer or recompute on every edit. So we sample: every step-th line plus
+    // the last one, and the caret line becomes the widest one that scrolls.
+    // The cost, stated honestly: sampling a very long line makes lineWidth()
+    // measure it whole, tens of milliseconds for a million characters.
     const quint32 lines = text->lineCount();
     int widest = 0;
 
@@ -1034,6 +1048,14 @@ void EditorView::updateScrollBars()
         }
 
         widest = std::max(widest, lineWidth(lines - 1));
+
+        // Always include the caret line: the user is looking at it, and if it is
+        // wider than every sampled line, dragging a selection would scroll past its end.
+        const quint32 caretLine = findLine(m_cursor, m_lineHint);
+
+        m_lineHint = caretLine;
+
+        widest = std::max(widest, lineWidth(caretLine));
     }
 
     const qint64 contentWidth = static_cast<qint64>(widest) + m_padding * 2;
@@ -1042,7 +1064,6 @@ void EditorView::updateScrollBars()
     horizontal->setRange(0, static_cast<int>(std::max<qint64>(0, contentWidth - textArea)));
     horizontal->setPageStep(textArea);
     horizontal->setSingleStep(std::max(1, m_metrics.codeWidth * 2));
-    setScrollBarVisible(horizontal, contentWidth > textArea);
 
     if (documentHeight <= viewHeight) {
         vertical->setValue(0);
@@ -1055,7 +1076,7 @@ void EditorView::updateScrollBars()
     m_reflowGuard = false;
 }
 
-// ============================== 事件 ==============================
+// ============================== events ==============================
 
 void EditorView::paintEvent(QPaintEvent *event)
 {
@@ -1085,22 +1106,23 @@ void EditorView::paintEvent(QPaintEvent *event)
     const quint32 total = text->lineCount();
     const int firstLine = std::max(0, scrollY / m_lineHeight);
 
-    // 横向滚动条会从视口底部吃掉一条，可见行数要按真正剩下的高度算
+    // a visible horizontal scrollbar eats a strip at the bottom of the viewport
     const int usableHeight = area.height() - (horizontal->isVisible() ? horizontal->height() : 0);
     const int visibleLines = std::max(1, usableHeight / m_lineHeight + 2);
 
     const int textLeft = m_gutter + m_padding;
     const int numberRight = m_gutter - GutterGap;
 
-    // 文字区的宽度：从 textLeft 一直到视口右边缘。正文裁剪、切可见段都用它，
-    // 和横向滚动条的范围计算保持同一套算法
+    // width of the text area, from textLeft to the right edge of the viewport.
+    // Used to clip the text and to pick the visible slice, so it matches the
+    // horizontal scroll range computation.
     const int textWidth = std::max(1, area.width() - textLeft);
 
     const bool hasSelection = (m_anchor != m_cursor);
     const quint32 selectionFrom = std::min(m_anchor, m_cursor);
     const quint32 selectionTo = std::max(m_anchor, m_cursor);
 
-    // 光标的位置只问一次，循环里拿它比对行号
+    // ask for the caret position once and compare lines inside the loop
     const Position caret = text->positionOf(m_cursor);
 
     const bool caretVisible = m_blinkOn && hasFocus();
@@ -1115,7 +1137,7 @@ void EditorView::paintEvent(QPaintEvent *event)
         const quint32 line = static_cast<quint32>(number);
         const int y = number * m_lineHeight - scrollY;
 
-        // ---- 行号 ----
+        // ---- line number ----
         painter.setPen(m_gutterText);
         painter.drawText(QRect(0, y, numberRight, m_lineHeight), Qt::AlignRight | Qt::AlignVCenter,
                          QString::number(number + 1));
@@ -1123,21 +1145,19 @@ void EditorView::paintEvent(QPaintEvent *event)
         const quint32 lineBegin = text->lineBegin(line);
         const quint32 lineEnd = text->lineEnd(line);
 
-        // 这一个循环体里只会为"当前这一行"建一次定位表，所以拿到的引用
-        // 在本轮结束前不会再被别的 lineMap() 调用弄失效
+        // exactly one lineMap() call per iteration, so this reference stays valid
+        // until the end of the round
         const LineMap &map = lineMap(line);
 
-        const int units = map.entryCount();
-
-        // ---- 选区 ----
-        // 选区可能横跨几百万个字符，但这里只画"落在屏幕里的那一段"：
-        // x1 / x2 是整条选区的两端，真正的裁剪交给 max / min，免得构造出一个
-        // 几百万像素宽的矩形
+        // ---- selection ----
+        // A selection can span millions of characters, but only the on-screen part
+        // is painted: x1 / x2 are the ends of the whole selection and max / min do
+        // the clipping, so no multi-million pixel rectangle is ever built.
         if (hasSelection && lineBegin <= selectionTo && lineEnd >= selectionFrom) {
             const quint32 from = std::max(lineBegin, selectionFrom);
             const quint32 to = std::min(lineEnd, selectionTo) + 1;
 
-            // 算减法的两个操作数都是行内字节列，天然不会有下溢
+            // both operands are in-line byte columns, so this cannot underflow
             const quint32 fromColumn = std::max(from, lineBegin) - lineBegin;
             const quint32 toColumn = std::max(to, lineBegin) - lineBegin;
 
@@ -1152,26 +1172,26 @@ void EditorView::paintEvent(QPaintEvent *event)
             }
         }
 
-        // ---- 正文 ----
-        // 屏幕上第一个可见字符：把"已经被横向滚掉的那段宽度"换算成字符下标。
-        // 这一步一次整除就能跳到对应的块，块内走几步，不扫全行
-        const quint32 wanted = static_cast<quint32>(std::max(0, scrollX - textLeft));
-        const int unit = map.entryAtByte(wanted);
+        // ---- text ----
+        // Character range actually on screen: both ends come from an exact
+        // pixel -> character query. Using entryAtByte(scrollX - textLeft) as the
+        // start was wrong: an unmeasured block can only report its head (4096
+        // bytes in a long line), which pushed the start far off the left edge and
+        // shifted the whole line, most visibly while dragging a selection.
+        int firstUnit = 0;
+        int lastUnit = 0;
 
-        // 最后一个可见字符：直接用 x 去问，不再靠"再多取几个字符"来兜底
-        int last = map.entryAtX(std::max(0, scrollX + textWidth) - textLeft) + 1;
+        map.windowForX(scrollX - textLeft, scrollX + textWidth - textLeft, firstUnit, lastUnit);
 
-        last = std::min(units, std::max(unit + 1, last));
+        const quint32 firstByte = map.byteAtEntry(firstUnit);
+        const quint32 lastByte = map.byteAtEntry(lastUnit);
 
-        const quint32 firstByte = map.byteAtEntry(unit);
-        const quint32 lastByte = map.byteAtEntry(last);
+        if (lastUnit > firstUnit && lastByte > firstByte) {
+            const int beginChar = map.charIndexAtEntry(firstUnit);
+            const int endChar = map.charIndexAtEntry(lastUnit);
 
-        if (last > unit && lastByte > firstByte) {
-            const int beginChar = map.charIndexAtEntry(unit);
-            const int endChar = map.charIndexAtEntry(last);
-
-            // 关键的一步：只从 TextBuffer 里切这一小段，绝不整行取出。
-            // 一百万个字符的单行在这里也只复制几十个字节
+            // the key step: slice only this small range out of TextBuffer, never the
+            // whole line. A million character line copies a few dozen bytes here.
             const std::string piece = text->range(lineBegin + firstByte, lineBegin + lastByte);
 
             const QString shown = LineMap::decode(piece).left(endChar - beginChar);
@@ -1180,18 +1200,17 @@ void EditorView::paintEvent(QPaintEvent *event)
 
             painter.setPen(m_textColor);
 
-            // 裁到文字区：切出来的这一段的左边缘通常落在屏幕左边之外
-            // （它对齐的是块头），不裁剪的话多出来的部分会画到行号栏和
-            // 窗口右边界外面去，看起来就像"显示区域错位"
+            // clip to the text area: the slice may start left of the viewport and
+            // would otherwise spill over the gutter and past the right edge
             painter.save();
             painter.setClipRect(QRect(textLeft, y, textWidth, m_lineHeight));
             painter.drawText(x, y + m_ascent, shown);
             painter.restore();
         }
 
-        // ---- 光标 ----
+        // ---- caret ----
+        // caretPixelX is LineMap::xAtColumn: one division into the block, one lookup
         if (caretVisible && caret.line == line) {
-            // caretPixelX 内部就是 LineMap::xAtColumn，一次整除 + 块内查一次
             const int caretX = textLeft + caretPixelX(line, caret.column) - scrollX;
 
             if (caretX >= area.left() - 2 && caretX <= area.right()) {
@@ -1200,7 +1219,7 @@ void EditorView::paintEvent(QPaintEvent *event)
         }
     }
 
-    // 滚动条和行号栏的交角，涂一下免得露出底色
+    // paint the corner where the scrollbars meet the gutter
     if (horizontal->isVisible() && vertical->isVisible()) {
         painter.fillRect(QRect(0, area.height() - horizontal->height(), m_gutter, horizontal->height()),
                          m_gutterColor);
@@ -1233,7 +1252,7 @@ void EditorView::mousePressEvent(QMouseEvent *event)
     const bool extend = (event->modifiers() & Qt::ShiftModifier) != 0;
 
     if (!extend) {
-        // 先把锚点落到新位置，等真的拖起来再决定要不要留一个"选中起点"
+        // drop the anchor here; a real drag decides whether a selection survives
         m_anchor = offset;
     }
 
@@ -1256,13 +1275,13 @@ void EditorView::mouseMoveEvent(QMouseEvent *event)
     const quint32 offset = offsetAt(event->position().toPoint());
 
     if (offset == m_cursor) {
-        // 同一个位置一直在动鼠标，不用重画
+        // same position, nothing to repaint
         return;
     }
 
     m_cursor = offset;
 
-    // 拖到窗口外面就自己滚，省得用户一边拖一边找滚动条
+    // auto-scroll while the drag leaves the viewport
     const QPoint at = event->position().toPoint();
     const QRect area = viewport()->rect();
 
@@ -1293,7 +1312,7 @@ void EditorView::mouseReleaseEvent(QMouseEvent *event)
 
     m_selecting = false;
 
-    // 点一下（没有拖动）等于把光标放这儿并清掉选区
+    // a click without a drag just puts the caret here
     if (m_anchor == m_cursor) {
         m_anchor = m_cursor;
     }
@@ -1303,8 +1322,9 @@ void EditorView::mouseReleaseEvent(QMouseEvent *event)
 
 void EditorView::mouseDoubleClickEvent(QMouseEvent *event)
 {
-    // 双击选中光标下的那一串"同类字符"：字母数字下划线算一类，其余各自成类。
-    // 用 TextBuffer::range() 只取当前这一行来扫，不整份文档拖出来
+    // Double click selects the run of same-class characters under the cursor:
+    // alphanumerics and _ form one class, everything else its own. Only the
+    // current line is pulled out of TextBuffer.
     TextBuffer *text = buffer();
 
     if (text == nullptr) {
@@ -1365,7 +1385,7 @@ void EditorView::mouseDoubleClickEvent(QMouseEvent *event)
 
 void EditorView::wheelEvent(QWheelEvent *event)
 {
-    // Ctrl + 滚轮留给"缩放"这种高级功能，这里只按行滚
+    // Ctrl + wheel is left for zoom; here it just scrolls by lines
     const int steps = event->angleDelta().y() / 120;
 
     if (steps != 0) {
@@ -1413,7 +1433,7 @@ quint32 EditorView::offsetAt(const QPoint &point)
     const QScrollBar *vertical = verticalScrollBar();
     const QScrollBar *horizontal = horizontalScrollBar();
 
-    // 屏幕坐标 -> 文档坐标
+    // screen coordinates -> document coordinates
     const int documentY = point.y() + vertical->value();
     const int documentX = point.x() + horizontal->value() - m_gutter - m_padding;
 
@@ -1421,8 +1441,8 @@ quint32 EditorView::offsetAt(const QPoint &point)
 
     const quint32 line = clampU32(rawLine, 0, text->lineCount() - 1);
 
-    // 鼠标定位：把 x 交给这一行的定位表。它会先在块表上二分，再在块内走几步，
-    // 所以哪怕这一行有一百万个字符，也只量了屏幕上看得见的那一块
+    // Hand x to this line index: it binary searches the block table and then walks
+    // a few characters, so a million character line only measures the block on screen.
     const quint32 column = lineMap(line).columnAtX(documentX);
 
     m_lineHint = line;

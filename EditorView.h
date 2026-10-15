@@ -7,6 +7,7 @@
 #include <QAbstractScrollArea>
 #include <QColor>
 #include <QFont>
+#include <QFontMetrics>
 #include <QHash>
 #include <QPoint>
 #include <QTimer>
@@ -14,15 +15,18 @@
 class Document;
 class QScrollBar;
 
-/// EditorView —— 自己画的文本视图。
+/// EditorView: a text view that paints itself.
 ///
-/// 它只做三件事：把 TextBuffer 里的文字画出来、记住光标在哪、把鼠标点击换算成
-/// 字节下标。文件读写完全交给 Document，这里一行都不碰文件。
+/// It does three things only: paint the text held by TextBuffer, remember where
+/// the caret is, and translate mouse clicks into byte offsets. File access
+/// belongs to Document; nothing here touches a file.
 ///
-/// 两个和性能有关的约定：
-///   * 画一行时**从不**把整行取出来。先问 LineMap"这一段屏幕对应哪几个字节"，
-///     再让 TextBuffer::range() 只切这一小段，所以一百万个字符的单行也不卡；
-///   * 光标定位和鼠标定位都走 LineMap 的两级块索引，不扫全行，也不用前缀和数组。
+/// Two performance rules:
+///   * painting a line never pulls out the whole line. It first asks LineMap
+///     which bytes the visible window maps to, then slices just those bytes out
+///     of TextBuffer, so a one-million-character line stays smooth;
+///   * caret and mouse resolution both go through the two level block index of
+///     LineMap: no full line scan and no prefix-sum array.
 class EditorView : public QAbstractScrollArea
 {
     Q_OBJECT
@@ -30,26 +34,24 @@ class EditorView : public QAbstractScrollArea
 public:
     explicit EditorView(QWidget *parent = nullptr);
 
-    /// 接管一个文档（不取得所有权，文档由主窗口持有）。换了文档之后缓存全部作废
+    /// Attach a document (not owned; the main window owns it). Drops all caches.
     void setDocument(Document *document);
 
-    /// 在光标处插入文本（\r\n 和单独的 \r 都会被缓冲区折成 \n），光标随之移到末尾
+    /// Insert text at the caret (\r\n and lone \r are folded to \n by the
+    /// buffer) and move the caret past it.
     void insertText(const QString &text);
 
-    /// 当前光标所在的行列（行列都从 0 开始，列按字节算）
+    /// Caret position, both row and column 0 based, column counted in bytes.
     Position cursorPosition() const;
 
-    /// 是否被改动过，主窗口用它判断"关窗口前要不要提醒保存"
     bool isModified() const { return m_modified; }
-
-    /// 把"已改动"标记抹掉，存盘之后调用
     void clearModified() { m_modified = false; }
 
-    /// 内容整个换掉了（打开文件）之后，重置光标、滚动条和全部缓存
+    /// Reset caret, scrollbars and every cache after the content was replaced.
     void resetView();
 
 signals:
-    /// 光标位置或改动状态变了，主窗口用它刷新状态栏
+    /// Caret or modified state changed; the main window refreshes its status bar.
     void cursorMoved();
 
 protected:
@@ -64,114 +66,128 @@ protected:
     void focusInEvent(QFocusEvent *event) override;
     void focusOutEvent(QFocusEvent *event) override;
 
+    /// Committed IME text arrives here, not through keyPressEvent. Without this
+    /// override Chinese input is silently dropped.
+    void inputMethodEvent(QInputMethodEvent *event) override;
+
 private slots:
     void blinkCaret();
 
 private:
-    /// document 里的文本缓冲区，没有文档时给 nullptr
+    /// Text buffer of the document, nullptr when there is none.
     TextBuffer *buffer() const;
 
-    /// 重新算字体宽度、行高、行号栏宽度和各种绘制尺寸
+    /// Recompute font metrics, line height, gutter width and paint geometry.
     void setupFont();
 
-    /// 光标或选区被改小之后，把两个下标夹回文档范围内
+    /// Clamp caret and anchor back into the document.
     void clampCursor();
 
-    /// 把光标滚进可视范围。横向只保证"看得见"，不居中，免得打字时光标乱跳
+    /// Move the caret to the nearest character boundary. Every document changing
+    /// operation goes through this: a caret inside a multi-byte UTF-8 character
+    /// would split that character and the text would look misplaced.
+    void snapCursorToCharBoundary();
+
+    /// Scroll the caret into view. Horizontally it only keeps the caret visible
+    /// instead of centring it, so typing does not make the view jump around.
     void ensureCursorVisible();
 
-    /// 重新设置两个滚动条的范围和可见性
+    /// Recompute both scrollbar ranges / page steps. Visibility is left to Qt's
+    /// AsNeeded policy.
     void updateScrollBars();
 
-    /// 只在可见性真的变化时才动滚动条，否则会和我们自己的 reflow 守卫打架
-    static void setScrollBarVisible(QScrollBar *bar, bool visible);
-
-    /// 行 line 的定位表（按需构造）。调用方拿到引用要立刻用完：
-    /// 期间再建别的行会让 QHash 重新散列，引用就悬了
+    /// Index of one line, built on demand. The caller must use the reference
+    /// immediately: building another line can rehash the QHash and invalidate it.
     const LineMap &lineMap(quint32 line);
 
-    /// 真的去构造某一行：只取这一行的字节交给 LineMap
+    /// Build one line index from that line's bytes only.
     LineMap buildLineMap(quint32 line);
 
-    /// 行 line 的像素宽度，会缓存住
+    /// Pixel width of a line, cached.
     int lineWidth(quint32 line);
 
-    /// 内容改过之后作废 offset 所在行及其后面所有行的缓存。
-    /// 前面的行号没变、内容也没变，所以刻意保留
+    /// Drop the cache of the line containing offset and of every line after it.
+    /// Earlier lines keep their number and content, so they are left alone.
     void forgetFrom(quint32 offset);
 
-    /// 字节下标 -> 行号。从 idea 行开始按指数扩张，不扫描整个文档
+    /// Byte offset -> line number: expand a window from the hint line instead of
+    /// scanning the document.
     quint32 findLine(quint32 offset, quint32 idea);
 
-    /// 光标位置的缓存：行号 + 行内字节列。上下移动要靠它保住目标列
+    /// Cached caret position: line number plus byte column inside that line.
+    /// Vertical movement uses it to keep the target column.
     struct CaretSpan
     {
-        quint32 line = 0;    ///< 行号
-        quint32 column = 0;  ///< 行内字节列
+        quint32 line = 0;    ///< line number
+        quint32 column = 0;  ///< byte column inside the line
     };
 
-    /// 取当前光标的行列（用一次 positionOf）
+    /// Current caret span, computed with one positionOf().
     CaretSpan caretSpan();
 
-    /// 行 line 有多少字节（不含换行符）
+    /// Length of a line in bytes, excluding the newline.
     quint32 lineByteLength(quint32 line);
 
-    /// 把光标放到"行 line 的第 column 个字节"上；keepSelection 为假时把锚点一起收过来
+    /// Put the caret at byte column of line. keepSelection false also collapses
+    /// the anchor onto the caret.
     void moveTo(quint32 line, quint32 column, bool keepSelection);
 
-    /// 把光标挪到某个字节下标处
+    /// Move the caret to a byte offset.
     void moveToOffset(quint32 offset, bool keepSelection);
 
-    /// 光标动过了：重置闪烁、滚进可视区、重画
+    /// Caret moved: restart blinking, scroll into view, repaint.
     void afterMove();
 
-    /// 复制 / 剪切 / 粘贴所选内容
-    void copyToClipboard(bool cut);
-
-    /// 粘贴剪贴板里的文本
-    void pasteFromClipboard();
-
-    /// 删除从 from 到 to 的区间，光标停在 from 上
+    /// Delete [from, to) and leave the caret at from.
     void deleteRange(quint32 from, quint32 to);
 
-    /// offset 是否落在 [begin, end] 这一行里
+    /// Is offset inside the line [begin, end]?
     static bool isLineOf(quint32 begin, quint32 end, quint32 offset);
 
-    /// 行首 / 行尾字节下标，没有文档时给 0
+    /// First / last byte of a line, 0 when there is no document.
     quint32 lineBeginOf(quint32 line);
     quint32 lineEndOf(quint32 line);
 
-    /// 屏幕坐标（视口坐标系）-> 字节下标
+    /// Viewport coordinates -> byte offset.
     quint32 offsetAt(const QPoint &point);
 
-    /// 左右方向键：行内走一个字符，走到行尾就换行。方向为 -1 表示左
+    /// Left/right arrow: one character inside the line, wrapping at the ends.
+    /// direction -1 means left.
     void moveCaret(TextBuffer *text, int direction, bool keepSelection);
 
-    /// Ctrl + 左右：往后 / 往前跳一个"词"。方向感由 forward 决定
+    /// Ctrl+left/right: jump one word, forward or backward.
     quint32 caretWordOffset(TextBuffer *text, bool forward);
 
-    /// 当前选中的文本，没选中就给空串（换行已经换成剪贴板要的 CRLF）
+    /// Selected text, empty when nothing is selected (newlines are already
+    /// converted to the CRLF the clipboard wants).
     QString selectionText();
 
-    /// 光标画在行 line 第 column 个字节处的 x（视口坐标系里还要再加上文字左边距）
+    /// Caret x inside a line, before the left text margin is added.
     int caretPixelX(quint32 line, quint32 column);
 
-    /// 从一个字节下标往前走一个字符（跨过整个 UTF-8 序列）
+    /// Step back one character (over the whole UTF-8 sequence).
     static quint32 stepBack(const std::string &text, quint32 offset);
 
-    /// 从一个字节下标往后走一个字符
+    /// Step forward one character.
     static quint32 stepForward(const std::string &text, quint32 offset);
 
-    /// UTF-16 转 UTF-8。自己写一遍，就为了不依赖 QTextCodec
+    /// UTF-16 to UTF-8, hand rolled to avoid depending on QTextCodec.
     static std::string toUtf8(const QString &text);
 
-    /// 把 v 夹进 [low, high]
+    /// Clamp v into [low, high].
     static quint32 clampU32(qint64 v, quint32 low, quint32 high);
 
     Document *m_document = nullptr;
 
-    // ---- 字体与度量 ----
     QFont m_font;
+
+    /// Must be a member, not a local of setupFont(): LineMap::Metrics stores a
+    /// pointer to it and dereferences it when measuring CJK glyphs (see
+    /// widthOfWideChar). A local QFontMetrics dies at the end of the constructor,
+    /// which leaves that pointer dangling: pure ASCII files still work (they use
+    /// the advance table), but the first Chinese character crashes deep inside Qt.
+    QFontMetrics m_fontMetrics;
+
     LineMap::Metrics m_metrics;
     int m_lineHeight = 16;
     int m_ascent = 12;
@@ -182,10 +198,10 @@ private:
     int m_caretTop = 2;
     int m_caretHeight = 14;
 
-    /// updateScrollBars() 正在跑。滚动条可见性一变，视口尺寸就变，又会绕回来
+    /// updateScrollBars() is running: showing a scrollbar resizes the viewport,
+    /// which would call back into it.
     bool m_reflowGuard = false;
 
-    // ---- 配色 ----
     QColor m_background;
     QColor m_gutterColor;
     QColor m_gutterText;
@@ -193,20 +209,17 @@ private:
     QColor m_selectionColor;
     QColor m_caretColor;
 
-    // ---- 光标与选区 ----
-    quint32 m_cursor = 0;  ///< 光标字节下标
-    quint32 m_anchor = 0;  ///< 选区起点，与光标相等时表示没有选区
+    quint32 m_cursor = 0;  ///< caret byte offset
+    quint32 m_anchor = 0;  ///< selection anchor, equal to the caret means no selection
     bool m_selecting = false;
     bool m_modified = false;
 
-    // ---- 光标闪烁 ----
     QTimer m_blinkTimer;
     bool m_blinkOn = true;
 
-    // ---- 定位缓存 ----
-    QHash<quint32, LineMap> m_lines;   ///< 行号 -> 定位表
-    QHash<quint32, int> m_widths;      ///< 行号 -> 行宽（只在算滚动范围时用）
-    quint32 m_lineHint = 0;            ///< 上次用过的行号，给 findLine 当出发点
+    QHash<quint32, LineMap> m_lines;  ///< line number -> index
+    QHash<quint32, int> m_widths;     ///< line number -> width, for the scroll range
+    quint32 m_lineHint = 0;           ///< last used line, the start point of findLine
 };
 
 #endif // EDITORVIEW_H

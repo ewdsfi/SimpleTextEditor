@@ -17,9 +17,9 @@
 
 namespace
 {
-/// QByteArray（UTF-8 字节）-> QString。
-/// 这里显式用 QStringDecoder，不碰 QTextCodec：那个类在 Qt6 里已经被挪到
-/// Qt5Compat 里去了，而我们只想安安静静读一个 UTF-8 文件
+/// QByteArray (UTF-8 bytes) -> QString.
+/// Uses QStringDecoder explicitly instead of QTextCodec: that class moved to
+/// Qt5Compat in Qt6, and reading one UTF-8 file needs nothing more than this
 QString decodeUtf8(const QByteArray &bytes)
 {
     QStringDecoder decoder(QStringDecoder::Utf8);
@@ -37,7 +37,7 @@ EditorWindow::EditorWindow(QWidget *parent)
     m_view->setDocument(m_document);
     setCentralWidget(m_view);
 
-    // ---- 文件菜单 ----
+    // ---- File menu ----
     QMenu *file = menuBar()->addMenu(QStringLiteral("文件(&F)"));
 
     QAction *open = file->addAction(QStringLiteral("打开(&O)..."));
@@ -61,7 +61,7 @@ EditorWindow::EditorWindow(QWidget *parent)
 
     connect(m_view, &EditorView::cursorMoved, this, &EditorWindow::refreshStatus);
 
-    // 状态栏先摆好标签，省得光标一动就要重新拼字符串
+    // put something in the status bar right away
     statusBar()->showMessage(QStringLiteral("就绪"));
 
     resize(1000, 680);
@@ -76,7 +76,7 @@ bool EditorWindow::openPath(const QString &path)
         return false;
     }
 
-    // 有没保存的东西就先问一句，免得白白丢掉
+    // ask before dropping unsaved work
     if (!confirmDiscard()) {
         return false;
     }
@@ -97,7 +97,7 @@ void EditorWindow::loadInto(const QString &path)
         return;
     }
 
-    // 文档整个换了，光标、滚动条、定位缓存都得回到初始状态
+    // the document changed completely: caret, scrollbars and caches all reset
     m_view->resetView();
 
     statusBar()->showMessage(QStringLiteral("已打开 %1：%2 行 %3 字节")
@@ -136,7 +136,7 @@ void EditorWindow::saveFile()
         return;
     }
 
-    // 还没有文件名就退化成"另存为"
+    // no file name yet, so this degrades into "Save As"
     saveFileAs();
 }
 
@@ -156,9 +156,9 @@ void EditorWindow::saveFileAs()
 
 bool EditorWindow::saveTo(const QString &path)
 {
-    // 空 path 表示"沿用当前路径"，也就是普通的保存
+    // an empty path means "keep the current one", i.e. an ordinary save
     if (!path.isEmpty()) {
-        // Document 只会写到 _path 上，所以"另存为"就是把路径换掉再写
+        // Document only ever writes to _path, so Save As is just swapping the path
         m_document->setPath(path.toUtf8().toStdString());
     }
 
@@ -195,7 +195,8 @@ bool EditorWindow::confirmDiscard()
     if (answer == QMessageBox::Save) {
         saveFile();
 
-        // 保存本身可能被取消（比如另存为对话框被关掉），那就当作不想继续
+        // the save itself may be cancelled (e.g. the Save As dialog was closed),
+        // which counts as "do not continue"
         return !m_view->isModified();
     }
 
@@ -241,7 +242,8 @@ QString EditorWindow::fromUtf8(const std::string &text)
 
 std::string EditorWindow::toUtf8(const QString &text)
 {
-    // 走 QString::toUtf8() 而不是手写编码：这里已经在 Qt 的地盘上，不用再绕
+    // use QString::toUtf8() instead of hand rolling the encoder: we are already
+    // inside Qt here
     const QByteArray bytes = text.toUtf8();
 
     return std::string(bytes.constData(), static_cast<size_t>(bytes.size()));

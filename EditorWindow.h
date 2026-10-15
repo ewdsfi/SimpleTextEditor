@@ -6,10 +6,11 @@
 class Document;
 class EditorView;
 
-/// EditorWindow —— 菜单 + 状态栏 + 一个 EditorView。
+/// EditorWindow: menu bar, status bar and one EditorView.
 ///
-/// 这一层只干两件事：把菜单动作接到 Document 的读写上，把光标位置显示到状态栏。
-/// 文本怎么画、光标怎么定位，全在 EditorView 里，这里一概不管。
+/// This layer only wires the menu actions to Document's read/write and shows the
+/// caret position in the status bar. How text is painted and how the caret is
+/// resolved is entirely EditorView's business.
 class EditorWindow : public QMainWindow
 {
     Q_OBJECT
@@ -17,7 +18,7 @@ class EditorWindow : public QMainWindow
 public:
     explicit EditorWindow(QWidget *parent = nullptr);
 
-    /// 打开一个文件（命令行参数走的就是这条路）
+    /// Open a file; this is the path a command line argument takes.
     bool openPath(const QString &path);
 
 protected:
@@ -28,23 +29,24 @@ private slots:
     void saveFile();
     void saveFileAs();
 
-    /// 光标动过了：更新状态栏
+    /// The caret moved: refresh the status bar.
     void refreshStatus();
 
 private:
-    /// 有未保存的改动时问一句，返回 false 表示用户按了取消
+    /// Ask before throwing away unsaved changes; false means the user cancelled.
     bool confirmDiscard();
 
-    /// 把 path 塞进视图并在状态栏显示结果
+    /// Load path into the view and report the result in the status bar.
     void loadInto(const QString &path);
 
-    /// 保存到 path（空串表示沿用当前路径）
+    /// Save to path (an empty path means "keep the current one").
     bool saveTo(const QString &path);
 
-    /// 窗口标题：文件名 + 星号（有未保存改动时）
+    /// Window title: file name plus a star while there are unsaved changes.
     void refreshTitle();
 
-    /// std::string（UTF-8）与 QString 之间的转换。自己转，不依赖 QTextCodec
+    /// Conversion between UTF-8 std::string and QString, hand rolled to avoid
+    /// depending on QTextCodec.
     static QString fromUtf8(const std::string &text);
     static std::string toUtf8(const QString &text);
 
